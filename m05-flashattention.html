@@ -1,0 +1,643 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE 5 — I/O-Aware Kernels (FlashAttention & FlashInfer)
+     Self-contained: only shared.css + shared.js. Vanilla JS + inline SVG.
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>I/O-Aware Kernels — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;5 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/flashattn/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 5 · Kernels &amp; memory</div>
+      <h1>I/O-Aware Kernels</h1>
+      <p class="lead">Attention's real cost is not the arithmetic — it is shuttling data between slow,
+      roomy <b>HBM</b> and fast, tiny <b>SRAM</b>. FlashAttention rewrites the kernel so the giant
+      <code>k×k</code> score matrix is never written to memory at all.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — memory hierarchy (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>The memory bottleneck: SRAM vs HBM</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Why attention is I/O-bound — the cores can compute far faster than memory can feed them.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 360" role="img" aria-label="GPU memory hierarchy comparing small fast SRAM with large slow HBM"></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> SRAM / on-chip compute</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> HBM (main memory)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> slow HBM traffic</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The GPU holds model weights and the KV cache in <b>HBM</b> — gigabytes, but comparatively
+      slow. The cores actually work out of <b>SRAM</b>: only tens of megabytes, yet with an order of
+      magnitude more bandwidth. Any kernel that keeps bouncing data between the two is limited by the
+      slow link, not by raw math. Attention, done naively, is exactly that kind of kernel.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — naive attention traffic (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Naive attention: materializing the <code>k×k</code> score matrix</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Each stage writes a full matrix to HBM and reads it back — and the score matrix is <code>O(k²)</code>.</p>
+
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 380" role="img" aria-label="Naive attention round-trips the full k by k score matrix through HBM multiple times"></svg>
+      </div>
+
+      <div id="ctrl2"></div>
+      <div id="cap2" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> HBM resident</span>
+        <span class="item"><span class="sw" style="background:var(--attn)"></span> score matrix S = QKᵀ</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> on-chip compute</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> expensive HBM round-trip</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">The key idea</span>
+      The score matrix <code>S = QKᵀ</code> is only an <em>intermediate</em>. There is no reason to send it
+      all the way out to HBM and read it back. FlashAttention fuses the whole computation into a
+      <b>single kernel</b> and keeps that intermediate on-chip — using an <b>online softmax</b> so it never
+      needs the full row of scores at once.
+    </div>
+
+    <!-- ================= FIGURE 3 — FlashAttention tiling + online softmax (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>FlashAttention: tiling + online softmax</h3>
+        <span class="tag">step-through · centerpiece</span>
+      </header>
+      <p class="blurb">One Q-tile in SRAM consumes K/V tiles in a stream, updating a running max <code>m</code> and
+      sum <code>ℓ</code> — the <code>k×k</code> matrix is never written out.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 420" role="img" aria-label="FlashAttention streams K and V tiles through SRAM, updating running max and sum, rescaling the output accumulator"></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+      <div id="cap3" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> HBM (Q, K, V blocks)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> SRAM tile compute</span>
+        <span class="item"><span class="sw" style="background:var(--attn)"></span> partial scores S<sub>ij</sub></span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> running stats m, ℓ</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> output accumulator O</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Because the softmax is computed <b>incrementally</b>, FlashAttention gets the
+      <em>exact same numbers</em> as the naive version — it just never spills the score matrix to HBM.
+      The K and V tiles are re-read once per Q-tile, but that is cheap next to round-tripping an
+      <code>O(k²)</code> matrix. The win grows with sequence length, which is why it especially
+      accelerates the long-context <b>prefill</b> stage.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — FlashInfer for serving (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>FlashInfer: I/O-aware attention for serving</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">The same fused kernel, but reading K/V from a <em>paged</em> cache across a
+      variable-length batch — the bridge to Modules 4 &amp; 8.</p>
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 320" role="img" aria-label="FlashInfer kernel gathers paged KV blocks for variable length sequences into SRAM"></svg>
+      </div>
+      <div id="ctrl4"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> paged KV blocks (HBM)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> FlashInfer kernel (SRAM)</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> output per sequence</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p><b>FlashInfer</b> is a set of inference-optimized kernels that implement FlashAttention while
+      gathering keys and values from <b>paged</b> KV layouts — the PagedAttention and RadixAttention
+      schemes from <a href="m04-batching.html">Module 4</a> — and handling ragged, variable-length
+      batches plus multi-head and grouped-query attention. Same I/O-aware core; serving-grade plumbing.</p>
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m04-batching.html"><span class="dir">← Previous</span><span class="ttl">Batching, Scheduling, and Paging</span></a>
+      <a class="next" href="m06-speculative.html"><span class="dir">Next →</span><span class="ttl">Speculative Decoding</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  // ===================================================================
+  // FIGURE 1 — Memory hierarchy: SRAM vs HBM  (Stepper)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg1");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // geometry
+    const sram = { x: 70,  y: 70,  w: 250, h: 120 };   // small + fast (green)
+    const hbm  = { x: 560, y: 60,  w: 300, h: 230 };   // large + slow (blue)
+
+    function chipBox(b, fill, title, sub) {
+      const g = S("g");
+      g.appendChild(S("rect", { x:b.x, y:b.y, width:b.w, height:b.h, rx:12,
+        fill:fill, "fill-opacity":.16, stroke:fill, "stroke-width":1.6 }));
+      g.appendChild(S("text", { x:b.x+14, y:b.y+26, class:"svg-title", text:title }));
+      if (sub) g.appendChild(S("text", { x:b.x+14, y:b.y+46, class:"svg-label", text:sub }));
+      return g;
+    }
+
+    function render(step, p) {
+      clear(svg);
+
+      // --- the two memories ---
+      svg.appendChild(chipBox(sram, C.compute, "SRAM · on-chip", "~tens of MB"));
+      svg.appendChild(chipBox(hbm,  C.mem,     "HBM · main memory", "tens of GB"));
+
+      // "cores" sitting inside SRAM region
+      svg.appendChild(S("text", { x:sram.x+14, y:sram.y+74, class:"svg-label",
+        fill:C.compute, text:"cores compute here" }));
+
+      // size contrast bars (step >= 1)
+      if (step >= 1) {
+        const baseY = 320, capW = (step >= 1 ? p : 0);
+        // SRAM capacity (tiny)
+        svg.appendChild(S("rect", { x:70, y:baseY-14, width:36, height:14, rx:3,
+          fill:C.compute, opacity:.9 }));
+        svg.appendChild(S("text", { x:70, y:baseY+16, class:"svg-label", text:"SRAM size" }));
+        // HBM capacity (huge)
+        svg.appendChild(S("rect", { x:170, y:baseY-14, width:300*capW, height:14, rx:3,
+          fill:C.mem, opacity:.9 }));
+        svg.appendChild(S("text", { x:170, y:baseY+16, class:"svg-label", text:"HBM size (≫ SRAM)" }));
+      }
+
+      // bandwidth contrast: animated packets on the link (step >= 2)
+      const linkY1 = sram.y + sram.h/2, linkY2 = hbm.y + 60;
+      svg.appendChild(S("line", { x1:sram.x+sram.w, y1:linkY1, x2:hbm.x, y2:linkY2,
+        stroke:C.border, "stroke-width":2 }));
+      svg.appendChild(S("text", { x:(sram.x+sram.w+hbm.x)/2 - 70, y:(linkY1+linkY2)/2 - 12,
+        class:"svg-label", text:"data link" }));
+
+      if (step >= 2) {
+        // a few packets crawling slowly along the link toward SRAM => "slow"
+        const n = 4;
+        for (let i = 0; i < n; i++) {
+          const ph = (p + i / n) % 1;
+          const px = lerp(hbm.x, sram.x + sram.w, ph);
+          const py = lerp(linkY2, linkY1, ph);
+          svg.appendChild(S("rect", { x:px-7, y:py-7, width:14, height:14, rx:3,
+            fill:C.warn, opacity:.85 }));
+        }
+        svg.appendChild(S("text", { x:(sram.x+sram.w+hbm.x)/2 - 96, y:(linkY1+linkY2)/2 + 18,
+          class:"svg-label", fill:C.warn, text:"low bandwidth → the bottleneck" }));
+      }
+
+      // verdict (step >= 3)
+      if (step >= 3) {
+        const oy = 60 + 20*ease(p);
+        svg.appendChild(S("rect", { x:70, y:oy, width:250, height:120, rx:12,
+          fill:"none", stroke:C.warn, "stroke-width":1.4, "stroke-dasharray":"5 5", opacity:p }));
+        svg.appendChild(S("text", { x:360, y:230, class:"svg-title", fill:C.warn, opacity:p,
+          text:"Attention is I/O-bound:" }));
+        svg.appendChild(S("text", { x:360, y:254, class:"svg-label", opacity:p,
+          text:"the cost is moving data," }));
+        svg.appendChild(S("text", { x:360, y:272, class:"svg-label", opacity:p,
+          text:"not the matrix math." }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption:  document.getElementById("cap1"),
+      captions: [
+        "<b>Two kinds of memory.</b> The GPU has a large but slow main memory, <span class='k'>HBM</span> (tens of GB — home of weights and the KV cache), and a small but very fast on-chip memory, <span class='k'>SRAM</span> (only tens of MB), where the cores actually compute.",
+        "<b>Size contrast.</b> HBM dwarfs SRAM in capacity — your full tensors live in HBM because they simply do not fit on-chip.",
+        "<b>Bandwidth contrast.</b> But HBM is comparatively <span class='k'>slow</span>: data crawls across the link. The cores can crunch numbers far faster than HBM can feed them.",
+        "<b>So attention is I/O-bound.</b> When a kernel keeps shuttling data back and forth, the slow HBM traffic — not the arithmetic — sets the speed. Fixing that is the whole game.",
+      ],
+      render,
+      dwell: 1900,
+      autoplay: false,
+    });
+  })();
+
+  // ===================================================================
+  // FIGURE 2 — Naive attention memory traffic  (Stepper)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg2");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // Left lane = HBM, right lane = on-chip compute
+    const HBM_X = 60,  HBM_W = 250;
+    const CMP_X = 610, CMP_W = 250;
+    const laneY = 56,  laneH = 300;
+
+    function lanes() {
+      const g = S("g");
+      g.appendChild(S("rect", { x:HBM_X, y:laneY, width:HBM_W, height:laneH, rx:12,
+        fill:C.mem, "fill-opacity":.10, stroke:C.mem, "stroke-width":1.4 }));
+      g.appendChild(S("text", { x:HBM_X+12, y:laneY+24, class:"svg-title", fill:C.mem, text:"HBM" }));
+      g.appendChild(S("rect", { x:CMP_X, y:laneY, width:CMP_W, height:laneH, rx:12,
+        fill:C.compute, "fill-opacity":.10, stroke:C.compute, "stroke-width":1.4 }));
+      g.appendChild(S("text", { x:CMP_X+12, y:laneY+24, class:"svg-title", fill:C.compute, text:"on-chip" }));
+      return g;
+    }
+
+    // a labeled tensor card
+    function card(x, y, w, h, label, fill, op) {
+      const g = S("g");
+      g.appendChild(S("rect", { x:x, y:y, width:w, height:h, rx:7,
+        fill:fill, "fill-opacity":op==null?.85:op, stroke:fill, "stroke-width":1 }));
+      g.appendChild(S("text", { x:x+w/2, y:y+h/2+4, "text-anchor":"middle",
+        class:"svg-label", fill:"#06121f", text:label }));
+      return g;
+    }
+
+    // arrow with a moving packet; dir=+1 HBM->compute (read), -1 compute->HBM (write)
+    function traffic(y, p, dir, warnLabel) {
+      const g = S("g");
+      const x1 = dir > 0 ? HBM_X+HBM_W : CMP_X;
+      const x2 = dir > 0 ? CMP_X : HBM_X+HBM_W;
+      g.appendChild(S("line", { x1:x1, y1:y, x2:x2, y2:y,
+        stroke:C.warn, "stroke-width":2, "stroke-dasharray":"6 5" }));
+      const px = lerp(x1, x2, ease(p));
+      g.appendChild(S("rect", { x:px-9, y:y-9, width:18, height:18, rx:4, fill:C.warn }));
+      g.appendChild(S("text", { x:(x1+x2)/2, y:y-14, "text-anchor":"middle",
+        class:"svg-label", fill:C.warn, text:warnLabel }));
+      return g;
+    }
+
+    // running tally of HBM round-trips
+    function tally(n) {
+      const g = S("g");
+      g.appendChild(S("text", { x:460, y:laneY+laneH+18, "text-anchor":"middle",
+        class:"svg-label", fill:C.warn, text:"HBM round-trips: " + n }));
+      return g;
+    }
+
+    // step plan: each step adds traffic + tally count
+    // 0 load Q,K  1 write S=QKᵀ  2 read S  3 write softmax  4 read+load V, write O
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(lanes());
+
+      // persistent HBM-resident inputs
+      svg.appendChild(card(HBM_X+18, laneY+44, 96, 30, "Q  k×dₖ", C.mem));
+      svg.appendChild(card(HBM_X+130, laneY+44, 96, 30, "K  k×dₖ", C.mem));
+      svg.appendChild(card(HBM_X+18, laneY+232, 96, 30, "V  k×dₖ", C.mem));
+
+      let trips = 0;
+
+      if (step === 0) {
+        svg.appendChild(traffic(laneY+59, p, +1, "load Q, K"));
+        svg.appendChild(card(CMP_X+18, laneY+44, 96, 30, "Q tile", C.compute));
+        svg.appendChild(card(CMP_X+130, laneY+44, 96, 30, "K tile", C.compute));
+      }
+      if (step >= 1) {
+        // the dreaded k×k score matrix, materialized in HBM
+        svg.appendChild(S("text", { x:HBM_X+18, y:laneY+118, class:"svg-label",
+          fill:C.attn, text:"S = QKᵀ  (k×k)" }));
+        svg.appendChild(card(HBM_X+18, laneY+128, 150, 80, "O(k²) scores", C.attn, .9));
+        trips = 1;
+      }
+      if (step === 1) {
+        svg.appendChild(traffic(laneY+168, p, -1, "WRITE S to HBM"));
+        svg.appendChild(card(CMP_X+18, laneY+128, 150, 60, "S = QKᵀ", C.compute));
+      }
+      if (step === 2) {
+        svg.appendChild(traffic(laneY+168, p, +1, "read S back"));
+        svg.appendChild(card(CMP_X+18, laneY+128, 150, 60, "softmax(S)", C.compute));
+        trips = 2;
+      }
+      if (step === 3) {
+        svg.appendChild(traffic(laneY+168, p, -1, "WRITE softmax(S)"));
+        svg.appendChild(card(HBM_X+18, laneY+128, 150, 80, "P = softmax(S)", C.attn, .9));
+        trips = 3;
+      }
+      if (step >= 3) {
+        svg.appendChild(card(HBM_X+18, laneY+128, 150, 80, "P  (k×k)", C.attn, .9));
+        svg.appendChild(S("text", { x:HBM_X+18, y:laneY+118, class:"svg-label",
+          fill:C.attn, text:"probabilities (k×k)" }));
+      }
+      if (step === 4) {
+        svg.appendChild(traffic(laneY+168, p*0.9+0.05, +1, "read P, load V"));
+        svg.appendChild(card(CMP_X+18, laneY+128, 150, 60, "P · V", C.compute));
+        // output written back
+        if (p > 0.4) svg.appendChild(traffic(laneY+275, (p-0.4)/0.6, -1, "WRITE O"));
+        svg.appendChild(card(HBM_X+130, laneY+232, 96, 30, "O  k×dₖ", C.token, .95));
+        trips = 4;
+      }
+
+      svg.appendChild(tally(step === 0 ? 0 : trips));
+
+      if (step === 4) {
+        svg.appendChild(S("text", { x:460, y:laneY+laneH+38, "text-anchor":"middle",
+          class:"svg-label", fill:C.warn,
+          text:"the full k×k matrix crossed HBM four times — that is the waste" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl2"),
+      caption:  document.getElementById("cap2"),
+      captions: [
+        "<b>Load Q and K.</b> Both are <code>k×dₖ</code>. They are streamed from HBM into the cores to begin the multiply.",
+        "<b>Write the scores.</b> The product <code>S = QKᵀ</code> is a full <span class='k'>k×k</span> matrix — <code>O(k²)</code> — and the naive kernel writes the whole thing back to HBM. <b>(round-trip 1)</b>",
+        "<b>Read it back.</b> To apply softmax, every score is fetched from HBM again. <b>(round-trip 2)</b>",
+        "<b>Write softmax.</b> The normalized probabilities <code>P = softmax(S)</code> — still <code>k×k</code> — are written back out to HBM. <b>(round-trip 3)</b>",
+        "<b>Read P, load V, write O.</b> P and V are read in, multiplied to the output <code>O = P·V</code> (<code>k×dₖ</code>), and O is written to HBM. <b>(round-trip 4)</b> — the <span class='k'>O(k²)</span> score matrix crossed the slow link four times.",
+      ],
+      render,
+      dwell: 2100,
+      autoplay: false,
+    });
+  })();
+
+  // ===================================================================
+  // FIGURE 3 — FlashAttention tiling + online softmax  (Stepper, centerpiece)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg3");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // HBM column on the left holds K/V tiles; SRAM box on the right does the work.
+    const HBM_X = 50, HBM_W = 150, HBM_Y = 60;
+    const SR_X = 300, SR_Y = 60, SR_W = 560, SR_H = 290;
+    const NK = 3;                       // number of K/V tiles consumed by this Q-tile
+
+    // running-stats values per step (illustrative, monotone & consistent)
+    // step 0: setup ; steps 1..3: consume tile j=1..3
+    const M = [null, 0.42, 0.71, 0.71];     // running max m (rises, then stable)
+    const L = [null, 1.00, 1.83, 2.41];     // running sum ℓ (accumulates)
+    const FILL = [0, 0, 0.45, 0.78];        // how "full" the output accumulator looks
+
+    function sramBox() {
+      const g = S("g");
+      g.appendChild(S("rect", { x:SR_X, y:SR_Y, width:SR_W, height:SR_H, rx:14,
+        fill:C.compute, "fill-opacity":.08, stroke:C.compute, "stroke-width":1.6 }));
+      g.appendChild(S("text", { x:SR_X+16, y:SR_Y+26, class:"svg-title", fill:C.compute,
+        text:"SRAM · single fused kernel" }));
+      return g;
+    }
+
+    function hbmColumn(activeJ, p) {
+      const g = S("g");
+      g.appendChild(S("rect", { x:HBM_X, y:HBM_Y, width:HBM_W, height:290, rx:12,
+        fill:C.mem, "fill-opacity":.10, stroke:C.mem, "stroke-width":1.4 }));
+      g.appendChild(S("text", { x:HBM_X+12, y:HBM_Y+22, class:"svg-title", fill:C.mem, text:"HBM" }));
+      g.appendChild(S("text", { x:HBM_X+12, y:HBM_Y+40, class:"svg-label", text:"K, V in blocks" }));
+      // Q tile (fetched once, lives in SRAM — show its origin highlighted)
+      g.appendChild(S("rect", { x:HBM_X+14, y:HBM_Y+54, width:122, height:26, rx:5,
+        fill:C.mem, opacity:.95 }));
+      g.appendChild(S("text", { x:HBM_X+14+61, y:HBM_Y+72, "text-anchor":"middle",
+        class:"svg-label", fill:"#06121f", text:"Q-tile" }));
+      // K/V tiles stacked
+      for (let j = 1; j <= NK; j++) {
+        const ty = HBM_Y + 92 + (j-1)*62;
+        const on = j === activeJ;
+        g.appendChild(S("rect", { x:HBM_X+14, y:ty, width:122, height:50, rx:6,
+          fill:C.kv, "fill-opacity": on ? .95 : .35, stroke:C.kv,
+          "stroke-width": on ? 2 : 1 }));
+        g.appendChild(S("text", { x:HBM_X+14+61, y:ty+22, "text-anchor":"middle",
+          class:"svg-label", fill:"#06121f", text:"K"+j+" / V"+j }));
+        g.appendChild(S("text", { x:HBM_X+14+61, y:ty+40, "text-anchor":"middle",
+          class:"svg-label", fill: on ? "#06121f" : C.faint, text: on ? "streaming…" : "waiting" }));
+      }
+      return g;
+    }
+
+    // a tile flying from HBM into SRAM
+    function streamTile(activeJ, p) {
+      if (!activeJ) return S("g");
+      const g = S("g");
+      const sy = HBM_Y + 92 + (activeJ-1)*62 + 25;
+      const ex = SR_X + 70, ey = SR_Y + 70;
+      const px = lerp(HBM_X+136, ex, ease(p));
+      const py = lerp(sy, ey, ease(p));
+      g.appendChild(S("line", { x1:HBM_X+136, y1:sy, x2:ex, y2:ey,
+        stroke:C.compute, "stroke-width":1.6, "stroke-dasharray":"5 5", opacity:.5 }));
+      g.appendChild(S("rect", { x:px-16, y:py-12, width:32, height:24, rx:5, fill:C.kv }));
+      return g;
+    }
+
+    function render(step, p) {
+      clear(svg);
+      const activeJ = step >= 1 ? Math.min(step, NK) : 0;
+
+      svg.appendChild(hbmColumn(activeJ, p));
+      svg.appendChild(sramBox());
+
+      // Q-tile resident in SRAM (fetched once, top-left)
+      svg.appendChild(S("rect", { x:SR_X+30, y:SR_Y+50, width:120, height:40, rx:7,
+        fill:C.mem, opacity:.95 }));
+      svg.appendChild(S("text", { x:SR_X+90, y:SR_Y+75, "text-anchor":"middle",
+        class:"svg-label", fill:"#06121f", text:"Q-tile (resident)" }));
+
+      // streaming animation of the active K/V tile
+      if (step >= 1 && step <= NK) svg.appendChild(streamTile(activeJ, p));
+
+      // partial score block Sij computed on-chip (rose)
+      if (step >= 1) {
+        svg.appendChild(S("rect", { x:SR_X+200, y:SR_Y+50, width:120, height:40, rx:7,
+          fill:C.attn, "fill-opacity":.92 }));
+        svg.appendChild(S("text", { x:SR_X+260, y:SR_Y+75, "text-anchor":"middle",
+          class:"svg-label", fill:"#06121f", text:"Sᵢ"+activeJ+" = Q·K"+activeJ+"ᵀ" }));
+        svg.appendChild(S("text", { x:SR_X+200, y:SR_Y+108, class:"svg-label", fill:C.attn,
+          text:"partial scores — stay on-chip" }));
+      }
+
+      // running stats panel (amber): m and ℓ
+      const stX = SR_X+370, stY = SR_Y+44;
+      svg.appendChild(S("rect", { x:stX, y:stY, width:165, height:96, rx:10,
+        fill:C.kv, "fill-opacity":.12, stroke:C.kv, "stroke-width":1.4 }));
+      svg.appendChild(S("text", { x:stX+12, y:stY+22, class:"svg-label", fill:C.kv,
+        text:"running stats" }));
+      const m = step >= 1 ? M[Math.min(step,NK)] : null;
+      const l = step >= 1 ? L[Math.min(step,NK)] : null;
+      svg.appendChild(S("text", { x:stX+12, y:stY+50, class:"svg-title", fill:C.text,
+        text:"max  m = " + (m==null ? "—" : m.toFixed(2)) }));
+      svg.appendChild(S("text", { x:stX+12, y:stY+76, class:"svg-title", fill:C.text,
+        text:"sum  ℓ = " + (l==null ? "—" : l.toFixed(2)) }));
+
+      // rescale arrow when stats update (step >= 1)
+      if (step >= 1) {
+        svg.appendChild(S("text", { x:SR_X+30, y:SR_Y+150, class:"svg-label", fill:C.kv,
+          text:"if a bigger max appears → rescale what we already have" }));
+      }
+
+      // output accumulator O (token/cyan), grows as tiles fold in
+      const accX = SR_X+30, accY = SR_Y+178, accW = 280, accH = 70;
+      svg.appendChild(S("rect", { x:accX, y:accY, width:accW, height:accH, rx:10,
+        fill:"none", stroke:C.token, "stroke-width":1.6 }));
+      const fillNow = step >= 1
+        ? lerp(FILL[Math.min(step,NK)-1] ?? 0, FILL[Math.min(step,NK)], step<=NK ? ease(p) : 1)
+        : 0;
+      svg.appendChild(S("rect", { x:accX, y:accY, width:accW*Math.max(0,fillNow), height:accH, rx:10,
+        fill:C.token, "fill-opacity":.85 }));
+      svg.appendChild(S("text", { x:accX+12, y:accY+accH/2+5, class:"svg-title",
+        fill: fillNow > 0.2 ? "#06121f" : C.token, text:"output accumulator  O" }));
+      svg.appendChild(S("text", { x:accX, y:accY+accH+20, class:"svg-label", fill:C.token,
+        text:"rescaled by m, ℓ as each tile folds in" }));
+
+      // "never materialized" banner on the right
+      svg.appendChild(S("rect", { x:SR_X+330, y:SR_Y+160, width:205, height:110, rx:10,
+        fill:C.warn, "fill-opacity":.07, stroke:C.warn, "stroke-width":1.2,
+        "stroke-dasharray":"5 5" }));
+      svg.appendChild(S("text", { x:SR_X+342, y:SR_Y+186, class:"svg-label", fill:C.warn,
+        text:"full k×k score matrix:" }));
+      svg.appendChild(S("text", { x:SR_X+342, y:SR_Y+208, class:"svg-title", fill:C.warn,
+        text:"NEVER written to HBM" }));
+      svg.appendChild(S("text", { x:SR_X+342, y:SR_Y+232, class:"svg-label",
+        text:"K/V re-read per Q-tile —" }));
+      svg.appendChild(S("text", { x:SR_X+342, y:SR_Y+250, class:"svg-label",
+        text:"far cheaper than O(k²)." }));
+
+      // final write-out on last step
+      if (step === NK + 1) {
+        svg.appendChild(S("line", { x1:accX+accW, y1:accY+accH/2, x2:HBM_X+HBM_W, y2:380,
+          stroke:C.token, "stroke-width":2, "stroke-dasharray":"6 5", opacity:ease(p) }));
+        svg.appendChild(S("text", { x:SR_X+40, y:SR_Y+300, class:"svg-title", fill:C.good,
+          opacity:ease(p), text:"All tiles consumed → write final O to HBM. Exact same result." }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl3"),
+      caption:  document.getElementById("cap3"),
+      captions: [
+        "<b>Fuse and tile.</b> Q, K and V are split into <span class='k'>blocks</span>. One Q-tile is fetched into SRAM <em>once</em>; the matching K/V tiles will be streamed past it. The whole attention computation runs in a <b>single kernel</b>.",
+        "<b>Tile 1.</b> The first K/V tile streams into SRAM. We compute partial scores <code>S<sub>i1</sub> = Q·K₁ᵀ</code> on-chip and seed the running stats: max <code>m = 0.42</code>, sum <code>ℓ = 1.00</code>. The output accumulator <code>O</code> takes its first contribution. Nothing is written to HBM.",
+        "<b>Tile 2 — online softmax.</b> The next tile arrives. Its scores push the running max up to <code>m = 0.71</code>, so the work already in <code>O</code> and the sum <code>ℓ</code> are <span class='k'>rescaled</span> to the new max before adding this tile (<code>ℓ = 1.83</code>). This rescale is what lets softmax proceed left-to-right without the full row.",
+        "<b>Tile 3.</b> The last K/V tile folds in. The max is already <code>0.71</code>, so we just accumulate: <code>ℓ = 2.41</code> and <code>O</code> grows again. Throughout, only small tiles and the tiny <code>(m, ℓ)</code> stats sit on-chip — the <span class='k'>k×k</span> score matrix is never created in HBM.",
+        "<b>Write out once.</b> With every K/V tile consumed, the finished output <code>O</code> for this Q-tile is written to HBM a single time. Because the softmax was tracked incrementally, the answer is <b>numerically identical</b> to the naive version — at a fraction of the memory traffic.",
+      ],
+      render,
+      dwell: 2300,
+      autoplay: false,
+    });
+  })();
+
+  // ===================================================================
+  // FIGURE 4 — FlashInfer: paged KV + variable-length batch  (Loop)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg4");
+    const { S, C, clear, lerp } = IOP;
+
+    // HBM page pool (top), a FlashInfer kernel (middle), outputs (right)
+    const seqs = [
+      { y: 70,  len: 5, color: C.kv },
+      { y: 150, len: 3, color: C.kv },
+      { y: 230, len: 6, color: C.kv },
+    ];
+    const PAGE_W = 30, PAGE_H = 34, GAP = 8, POOL_X = 60;
+    const KERN_X = 470, KERN_Y = 60, KERN_W = 150, KERN_H = 200;
+    const OUT_X = 720;
+
+    function render(t) {
+      clear(svg);
+
+      // kernel box (SRAM / on-chip)
+      svg.appendChild(S("rect", { x:KERN_X, y:KERN_Y, width:KERN_W, height:KERN_H, rx:14,
+        fill:C.compute, "fill-opacity":.10, stroke:C.compute, "stroke-width":1.6 }));
+      svg.appendChild(S("text", { x:KERN_X+KERN_W/2, y:KERN_Y+34, "text-anchor":"middle",
+        class:"svg-title", fill:C.compute, text:"FlashInfer" }));
+      svg.appendChild(S("text", { x:KERN_X+KERN_W/2, y:KERN_Y+56, "text-anchor":"middle",
+        class:"svg-label", text:"fused attention" }));
+      svg.appendChild(S("text", { x:KERN_X+KERN_W/2, y:KERN_Y+74, "text-anchor":"middle",
+        class:"svg-label", text:"kernel (SRAM)" }));
+
+      // "HBM page pool" label
+      svg.appendChild(S("text", { x:POOL_X, y:48, class:"svg-title", fill:C.mem, text:"Paged KV cache in HBM" }));
+
+      seqs.forEach((sq, si) => {
+        // sequence label
+        svg.appendChild(S("text", { x:POOL_X-2, y:sq.y-6, class:"svg-label",
+          text:"seq "+(si+1)+"  ("+sq.len+" pages)" }));
+        // non-contiguous pages: jitter x slightly to suggest scattered layout
+        for (let j = 0; j < sq.len; j++) {
+          const jitter = ((si*7 + j*13) % 3) * 6;
+          const x = POOL_X + j*(PAGE_W+GAP) + jitter;
+          svg.appendChild(S("rect", { x:x, y:sq.y, width:PAGE_W, height:PAGE_H, rx:5,
+            fill:sq.color, "fill-opacity":.5, stroke:sq.color, "stroke-width":1 }));
+        }
+
+        // a packet gathered from a moving page into the kernel
+        const period = sq.len;
+        const phase = (t * 0.6 + si * 0.33) % 1;          // 0..1 across this seq's pages
+        const idx = Math.floor(phase * period);
+        const sub = (phase * period) - idx;
+        const jitter = ((si*7 + idx*13) % 3) * 6;
+        const sx = POOL_X + idx*(PAGE_W+GAP) + jitter + PAGE_W/2;
+        const sy0 = sq.y + PAGE_H/2;
+        const ex = KERN_X, ey = KERN_Y + 60 + si*55;
+        const px = lerp(sx, ex, sub);
+        const py = lerp(sy0, ey, sub);
+        // gather line
+        svg.appendChild(S("line", { x1:sx, y1:sy0, x2:ex, y2:ey,
+          stroke:sq.color, "stroke-width":1, "stroke-dasharray":"4 5", opacity:.35 }));
+        // highlight the active page
+        const ax = POOL_X + idx*(PAGE_W+GAP) + jitter;
+        svg.appendChild(S("rect", { x:ax, y:sq.y, width:PAGE_W, height:PAGE_H, rx:5,
+          fill:sq.color, "fill-opacity":.95, stroke:sq.color, "stroke-width":1.5 }));
+        // moving gathered block
+        svg.appendChild(S("rect", { x:px-7, y:py-7, width:14, height:14, rx:3, fill:sq.color }));
+
+        // output token emitted per sequence (pulse)
+        const pulse = 0.5 + 0.5*Math.sin(t*2 + si);
+        svg.appendChild(S("rect", { x:OUT_X, y:ey-13, width:120, height:26, rx:6,
+          fill:C.token, "fill-opacity": 0.35 + 0.5*pulse }));
+        svg.appendChild(S("text", { x:OUT_X+60, y:ey+5, "text-anchor":"middle",
+          class:"svg-label", fill:"#06121f", text:"out seq "+(si+1) }));
+        // kernel -> output link
+        svg.appendChild(S("line", { x1:KERN_X+KERN_W, y1:ey, x2:OUT_X, y2:ey,
+          stroke:C.token, "stroke-width":1.4, "stroke-dasharray":"3 4", opacity:.5 }));
+      });
+
+      svg.appendChild(S("text", { x:POOL_X, y:300, class:"svg-label",
+        text:"variable-length sequences · non-contiguous pages gathered on the fly (PagedAttention / RadixAttention)" }));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl4"), render, autoplay: true, speed: 1 });
+  })();
+  </script>
+</body>
+</html>

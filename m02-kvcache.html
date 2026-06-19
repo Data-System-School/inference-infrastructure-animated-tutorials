@@ -1,0 +1,594 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE 2 — Inference and the KV Cache
+     Companion animations for https://iop.systems/blog/llm-inference/kvcache/
+     Self-contained: only shared.css + shared.js. Vanilla JS + inline SVG.
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inference and the KV Cache — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;2 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/kvcache/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 2 · Inference execution</div>
+      <h1>Inference and the KV Cache</h1>
+      <p class="lead">Generating text is two phases: a parallel <b>prefill</b> of the prompt, then a one-token-at-a-time <b>decode</b>. Naively, decode recomputes attention for the whole history every step. The KV cache stores the past keys and values so each step does only a sliver of new work — trading memory for compute.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Prefill vs decode (Stepper) ============== -->
+    <section class="figure">
+      <header>
+        <h3>Two phases: parallel prefill, then sequential decode</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Prefill ingests the whole prompt in one parallel pass; decode then emits one token per pass, feeding each output back as the next input.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 360" role="img" aria-label="Prefill processes the whole prompt in parallel; decode generates one token at a time"></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> prompt / generated token</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> compute-bound (parallel)</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> memory-bound (sequential)</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV cache</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Prefill and decode run the <strong>same</strong> transformer layers — they differ only in <em>granularity</em>. Prefill pushes many tokens through at once (lots of parallel math), while decode pushes a single new token through but must read the entire prior sequence. Both build <code>Q</code>, <code>K</code>, <code>V</code> matrices with one row per token. The next two figures zoom into the attention step to see where decode wastes work — and how to stop it.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — WITHOUT a KV cache (Stepper) ============= -->
+    <section class="figure">
+      <header>
+        <h3>Without a KV cache: recomputing the whole history every step</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Each decode step rebuilds K and V for <em>every</em> previous token, then multiplies Q×Kᵀ — yet the shaded block is identical to last step's result. That redundant work grows every step: quadratic total compute.</p>
+
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 380" role="img" aria-label="Without a KV cache the model recomputes K and V for all previous tokens each decode step, repeating work"></svg>
+      </div>
+
+      <div id="ctrl2"></div>
+      <div id="cap2" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> new token's Q</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> K / V (needed)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> recomputed work (wasted)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> new attention scores</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">The key observation</span>
+      Look at the top-left corner of <code>Q×Kᵀ</code>: it is <b>identical</b> to the previous iteration. Causal masking means past tokens never attend to future ones, so their scores can't change. The only genuinely new work is the <b>new token's Q row</b> against the full <code>Kᵀ</code>, then against <code>V</code>. Everything else is recompute.
+    </div>
+
+    <!-- ================= FIGURE 3 — WITH the KV cache (Stepper) ============== -->
+    <section class="figure">
+      <header>
+        <h3>With the KV cache: compute one new token, append, attend</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Past K and V live in the cache (amber). Each step computes only the new token's Q, K, V, appends K,V to the cache, and multiplies the one new Q row against the whole cache. Per-step work is tiny and constant-shaped — linear total instead of quadratic.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 380" role="img" aria-label="With a KV cache each step computes only the new token's Q,K,V, appends K and V to the cache, and attends the new Q against the cache"></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+      <div id="cap3" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> cached K / V (reused)</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> new token's Q</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> only-new compute</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The KV cache <strong>trades memory for compute</strong>: by storing past keys and values, it turns the per-step quadratic attention into a single Q-row times the cache — linear work per token. That's why decode is <em>memory-bound</em>: the bottleneck shifts from doing math to reading the ever-growing cache out of HBM. Next: how big does that cache actually get?</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — KV cache memory growth (Loop) =========== -->
+    <section class="figure">
+      <header>
+        <h3>The cost: KV cache memory grows linearly with the sequence</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Every generated token appends one K and one V vector in every head of every layer. The cache fills steadily as the sequence grows — and that is exactly what MQA / GQA / MLA shrink.</p>
+
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 340" role="img" aria-label="KV cache memory grows linearly with sequence length, filling a memory bar as generation proceeds"></svg>
+      </div>
+
+      <div id="ctrl4"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV cache (in HBM)</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> free HBM</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> over the cap → eviction</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Per-token cache size</span>
+      Bytes per token ≈ <code>layers × heads × 2 (K and V) × d_head × bytes_per_element</code>. It scales with sequence length and with batch size, and can grow <b>unboundedly</b> — so runtimes set a maximum size and evict tokens past it (carefully: dropping the earliest <b>attention-sink</b> tokens collapses quality). <b>MQA / GQA / MLA</b> from Module&nbsp;1 cut the <code>heads</code> factor, shrinking every number above.
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m01-transformers.html"><span class="dir">← Previous</span><span class="ttl">LLMs and Transformers</span></a>
+      <a class="next" href="m03-sharding.html"><span class="dir">Next →</span><span class="ttl">Sharding a Model</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  "use strict";
+
+  // shared tiny helpers --------------------------------------------------
+  const PROMPT = ["The", "cat", "sat"];          // illustrative 3-token prompt (matches article)
+  const GEN    = ["on", "the", "mat"];           // illustrative generated tokens
+
+  function cellLabel(svg, x, y, w, h, txt, fill, opacity, txtFill) {
+    const g = IOP.S("g", {});
+    g.appendChild(IOP.S("rect", { x, y, width: w, height: h, rx: 7,
+      fill, opacity: opacity == null ? 0.9 : opacity, stroke: "rgba(255,255,255,.10)" }));
+    if (txt != null) g.appendChild(IOP.S("text", {
+      x: x + w / 2, y: y + h / 2 + 4, "text-anchor": "middle",
+      "font-family": IOP.C ? "var(--mono)" : "monospace", "font-size": 12.5,
+      fill: txtFill || "#06121f", "font-weight": 600, text: txt }));
+    svg.appendChild(g);
+    return g;
+  }
+
+  // ===================== FIGURE 1 — Prefill vs decode (Stepper) =========
+  (function () {
+    const svg = document.getElementById("svg1");
+    const { S, C, clear, ease, lerp } = IOP;
+
+    // layout
+    const promptX = 70, rowY = 70, tw = 64, th = 40, gap = 10;
+    const genStartX = 70;
+
+    function tokenBox(x, y, w, h, label, fill, p, txtFill) {
+      svg.appendChild(S("rect", { x, y, width: w, height: h, rx: 8,
+        fill, opacity: 0.92 * p + 0.06, stroke: "rgba(255,255,255,.12)" }));
+      svg.appendChild(S("text", { x: x + w / 2, y: y + h / 2 + 5, "text-anchor": "middle",
+        "font-size": 14, "font-weight": 600, fill: txtFill || "#06121f",
+        "font-family": "var(--font)", text: label, opacity: p }));
+    }
+
+    function band(x, y, w, h, fill, label, p) {
+      svg.appendChild(S("rect", { x, y, width: w, height: h, rx: 10, fill, opacity: 0.16 * p,
+        stroke: fill, "stroke-opacity": 0.55 * p }));
+      svg.appendChild(S("text", { x: x + 14, y: y + 22, "font-size": 12.5, "font-family": "var(--mono)",
+        fill, text: label, opacity: p }));
+    }
+
+    function render(step, p) {
+      clear(svg);
+
+      // ---- PREFILL band (left) ----
+      band(40, 40, 360, 270, C.compute, "PREFILL · parallel · compute-bound", step === 0 ? p : 1);
+      // prompt tokens appear together (parallel)
+      for (let i = 0; i < PROMPT.length; i++) {
+        const pp = step === 0 ? ease(IOP.clamp(p * 1.2 - i * 0.04, 0, 1)) : 1;
+        tokenBox(promptX + i * (tw + gap), rowY, tw, th, PROMPT[i], C.token, pp);
+      }
+      // "one parallel pass" arrow + KV seeded
+      if (step >= 0) {
+        const pa = step === 0 ? p : 1;
+        svg.appendChild(S("path", { d: "M70,140 L320,140", stroke: C.compute, "stroke-width": 3,
+          "marker-end": "url(#a1)", opacity: 0.85 * pa, fill: "none" }));
+        svg.appendChild(S("text", { x: 195, y: 132, "text-anchor": "middle", "font-size": 12,
+          "font-family": "var(--mono)", fill: C.compute, text: "1 parallel pass", opacity: pa }));
+        // KV cache seeded with the 3 prompt tokens
+        const kvP = step === 0 ? ease(IOP.clamp(p * 1.5 - 0.4, 0, 1)) : 1;
+        svg.appendChild(S("text", { x: 70, y: 200, "font-size": 12, "font-family": "var(--mono)",
+          fill: C.kv, text: "KV cache", opacity: kvP }));
+        for (let i = 0; i < 3; i++)
+          cellLabel(svg, 70 + i * 30, 210, 24, 34, null, C.kv, 0.9 * kvP, "#06121f");
+        svg.appendChild(S("text", { x: 70, y: 268, "font-size": 11.5, "font-family": "var(--mono)",
+          fill: C.muted, text: "3 prompt tokens → 3 K,V", opacity: kvP }));
+      }
+
+      // ---- DECODE band (right) ----
+      const decShown = step >= 1;
+      band(440, 40, 440, 270, C.mem, "DECODE · sequential · memory-bound", decShown ? (step === 1 ? p : 1) : 0);
+
+      // generated tokens stack up one per step
+      for (let i = 0; i < GEN.length; i++) {
+        const visibleStep = i + 1;            // appears at step (i+1)
+        if (step < visibleStep) continue;
+        const isNew = step === visibleStep;
+        const pp = isNew ? ease(p) : 1;
+        // place generated tokens in a row inside decode band
+        const gx = 470 + i * (tw + gap);
+        tokenBox(gx, rowY, tw, th, GEN[i], C.token, pp);
+        // arrow: previous output feeds next input
+        if (i > 0) {
+          svg.appendChild(S("path", {
+            d: `M${470 + (i - 1) * (tw + gap) + tw},${rowY + th / 2} L${gx},${rowY + th / 2}`,
+            stroke: C.token, "stroke-width": 2, "marker-end": "url(#a1)", fill: "none",
+            opacity: 0.7 * (isNew ? p : 1) }));
+        }
+      }
+      // "one token per pass" note + KV grows by 1
+      if (decShown) {
+        svg.appendChild(S("text", { x: 470, y: 140, "font-size": 12, "font-family": "var(--mono)",
+          fill: C.mem, text: "+1 token per pass (uses prior sequence)" }));
+        // growing KV cache cells in decode region
+        svg.appendChild(S("text", { x: 470, y: 200, "font-size": 12, "font-family": "var(--mono)",
+          fill: C.kv, text: "KV cache (grows)" }));
+        const total = 3 + Math.min(step, GEN.length); // 3 prompt + generated so far
+        for (let i = 0; i < total; i++) {
+          const isAppended = i >= 3 && i === total - 1 && step <= GEN.length;
+          const cp = isAppended ? ease(p) : 1;
+          cellLabel(svg, 470 + i * 30, 210, 24, 34, null, C.kv, (i < 3 ? 0.55 : 0.95) * cp, "#06121f");
+        }
+        svg.appendChild(S("text", { x: 470, y: 268, "font-size": 11.5, "font-family": "var(--mono)",
+          fill: C.muted, text: `${3 + Math.min(step, GEN.length)} tokens cached` }));
+      }
+
+      // arrow marker def
+      const defs = S("defs", {});
+      defs.appendChild(S("marker", { id: "a1", markerWidth: 8, markerHeight: 8, refX: 7, refY: 4,
+        orient: "auto", markerUnits: "userSpaceOnUse" },
+        [S("path", { d: "M0,0 L8,4 L0,8 z", fill: C.token })]));
+      svg.appendChild(defs);
+
+      // phase title
+      svg.appendChild(S("text", { x: 40, y: 28, "font-size": 13, "font-weight": 700,
+        "font-family": "var(--font)", fill: C.text,
+        text: step === 0 ? "Phase 1 — Prefill the prompt" : "Phase 2 — Decode, one token at a time" }));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption: document.getElementById("cap1"),
+      captions: [
+        "<b>Prefill.</b> The whole prompt is available at once, so all 3 tokens go through the transformer in <span class='k'>one parallel pass</span>. Lots of math, no waiting — it is <span class='k'>compute-bound</span>. This seeds the KV cache with 3 keys and values.",
+        "<b>Decode step 1.</b> Now generation is <span class='k'>autoregressive</span>: each new token needs the previous one, so we run one token per pass. It reads the entire prior sequence — <span class='k'>memory-bound</span> — and appends one K,V to the cache.",
+        "<b>Decode step 2.</b> The token just produced becomes the next input. Another single pass, another K,V appended. The cache now holds 5 entries.",
+        "<b>Decode step 3.</b> Same loop again. Prefill was one big parallel burst; decode is a long sequence of tiny passes that each lean on the growing <span class='k'>KV cache</span>.",
+      ],
+      render,
+      dwell: 1900,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 2 — WITHOUT a KV cache (Stepper) ========
+  (function () {
+    const svg = document.getElementById("svg2");
+    const { S, C, clear, ease } = IOP;
+
+    // We visualize the Q x K^T score matrix growing each decode step.
+    // n = number of tokens currently in the sequence.
+    // The top-left (n-1 x n-1) block is recomputed (warn). Only the last
+    // row (new token's Q against all K) is genuinely new (compute).
+    const cell = 40, ox = 360, oy = 90;   // matrix origin
+    const startN = 3;                      // after prefill we have 3 tokens
+
+    function render(step, p) {
+      clear(svg);
+      const n = startN + step;             // tokens this step (3,4,5,6)
+      const tokens = PROMPT.concat(GEN).slice(0, n);
+
+      // Title / equation
+      svg.appendChild(S("text", { x: 40, y: 30, "font-size": 13, "font-weight": 700,
+        "font-family": "var(--font)", fill: C.text,
+        text: `Decode step ${step + 1}: recompute Q×Kᵀ for all ${n} tokens` }));
+      svg.appendChild(S("text", { x: 40, y: 56, "font-size": 12.5, "font-family": "var(--mono)",
+        fill: C.muted, text: "scores  =  Q × Kᵀ   (one row per token)" }));
+
+      // left: rebuild K & V for ALL tokens (all recomputed = warn)
+      svg.appendChild(S("text", { x: 40, y: 92, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.warn, text: "rebuild K,V for every token:" }));
+      for (let i = 0; i < n; i++) {
+        const pop = ease(IOP.clamp(p * 1.3 - i * 0.05, 0, 1));
+        cellLabel(svg, 40 + i * 26, 104, 20, 30, null, C.warn, 0.85 * pop, "#1a0606");
+      }
+      svg.appendChild(S("text", { x: 40, y: 156, "font-size": 11.5, "font-family": "var(--mono)",
+        fill: C.muted, text: `${n} K + ${n} V vectors recomputed` }));
+
+      // Q column labels (rows) and K^T row labels (cols)
+      for (let i = 0; i < n; i++) {
+        // row tokens (Q)
+        svg.appendChild(S("text", { x: ox - 12, y: oy + i * cell + cell / 2 + 4, "text-anchor": "end",
+          "font-size": 11.5, "font-family": "var(--mono)", fill: C.token, text: tokens[i] }));
+        // col tokens (K)
+        svg.appendChild(S("text", { x: ox + i * cell + cell / 2, y: oy - 10, "text-anchor": "middle",
+          "font-size": 11.5, "font-family": "var(--mono)", fill: C.kv, text: tokens[i] }));
+      }
+      svg.appendChild(S("text", { x: ox - 12, y: oy - 10, "text-anchor": "end", "font-size": 11,
+        "font-family": "var(--mono)", fill: C.muted, text: "Q↓ / K→" }));
+
+      // matrix cells, with causal mask (upper triangle blank)
+      for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+          const x = ox + c * cell, y = oy + r * cell;
+          if (c > r) {
+            // masked (future) — faint outline only
+            svg.appendChild(S("rect", { x, y, width: cell - 4, height: cell - 4, rx: 5,
+              fill: "none", stroke: "rgba(255,255,255,.06)" }));
+            svg.appendChild(S("text", { x: x + (cell - 4) / 2, y: y + (cell - 4) / 2 + 4,
+              "text-anchor": "middle", "font-size": 12, fill: "rgba(255,255,255,.18)", text: "—" }));
+            continue;
+          }
+          const isNewRow = r === n - 1;                 // new token's Q row = genuinely new
+          let fill, op;
+          if (isNewRow) { fill = C.compute; op = 0.92 * ease(p); }
+          else { fill = C.warn; op = 0.55; }            // recomputed (identical to last step)
+          svg.appendChild(S("rect", { x, y, width: cell - 4, height: cell - 4, rx: 5,
+            fill, opacity: op, stroke: "rgba(255,255,255,.10)" }));
+        }
+      }
+
+      // highlight: the (n-1)x(n-1) top-left block is identical to previous step
+      if (n > startN) {
+        const bw = (n - 1) * cell - 4, bh = (n - 1) * cell - 4;
+        svg.appendChild(S("rect", { x: ox - 2, y: oy - 2, width: bw + 4, height: bh + 4, rx: 8,
+          fill: "none", stroke: C.warn, "stroke-width": 2, "stroke-dasharray": "6 4",
+          opacity: 0.9 }));
+        svg.appendChild(S("text", { x: ox + bw / 2, y: oy + bh + 24, "text-anchor": "middle",
+          "font-size": 11.5, "font-family": "var(--mono)", fill: C.warn,
+          text: "↑ identical to last step — wasted recompute" }));
+      }
+      // label the new row
+      svg.appendChild(S("text", { x: ox + n * cell + 12, y: oy + (n - 1) * cell + cell / 2 + 4,
+        "font-size": 11.5, "font-family": "var(--mono)", fill: C.compute, text: "← only new work",
+        opacity: ease(p) }));
+
+      // running waste tally
+      svg.appendChild(S("text", { x: 40, y: 210, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.warn, text: `wasted this step: ${(n - 1)} recomputed row(s)` }));
+      svg.appendChild(S("text", { x: 40, y: 232, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.muted, text: `total work so far ∝ 1+2+…+${n}  (quadratic)` }));
+
+      // small quadratic bars at bottom-left to convey growth
+      const bx = 40, by = 360;
+      for (let s = 0; s <= step; s++) {
+        const nn = startN + s;
+        const hgt = nn * nn * 1.1;
+        svg.appendChild(S("rect", { x: bx + s * 28, y: by - hgt, width: 20, height: hgt, rx: 3,
+          fill: s === step ? C.warn : "rgba(248,113,113,.45)", opacity: s === step ? ease(p) : 1 }));
+      }
+      svg.appendChild(S("text", { x: bx, y: by + 14, "font-size": 10.5, "font-family": "var(--mono)",
+        fill: C.faint, text: "per-step work ↑↑" }));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl2"),
+      caption: document.getElementById("cap2"),
+      captions: [
+        "<b>After prefill</b> we have 3 tokens. To attend, the model builds <span class='k'>Q, K, V</span> with one row per token and computes the score matrix <span class='k'>Q×Kᵀ</span>. Causal masking blanks the upper triangle (no token attends to the future).",
+        "<b>Decode step 2 — no cache.</b> A new token arrives, so K and V are <span class='k'>rebuilt for all 4 tokens</span>. But the top-left 3×3 block of Q×Kᵀ is <b>identical</b> to last step — pure <span class='k'>wasted recompute</span>. Only the new bottom row is real work.",
+        "<b>Decode step 3.</b> Five tokens now. Again K,V are recomputed for everyone; the dashed 4×4 block just repeats prior results. The wasted region keeps <span class='k'>growing</span>.",
+        "<b>Decode step 4.</b> Six tokens. Total compute scales like 1+2+…+n — <span class='k'>quadratic</span>. The red bars show per-step work climbing fast. Almost all of it is redundant. There must be a better way.",
+      ],
+      render,
+      dwell: 2000,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 3 — WITH the KV cache (Stepper) =========
+  (function () {
+    const svg = document.getElementById("svg3");
+    const { S, C, clear, ease } = IOP;
+
+    const startN = 3;
+    const cacheX = 70, cacheY = 110, cw = 34, ch = 44, cgap = 8;
+
+    function render(step, p) {
+      clear(svg);
+      const n = startN + step;                       // total tokens incl new
+      const cachedBefore = n - 1;                     // K,V already in cache from prior steps
+      const tokens = PROMPT.concat(GEN).slice(0, n);
+
+      svg.appendChild(S("text", { x: 40, y: 30, "font-size": 13, "font-weight": 700,
+        "font-family": "var(--font)", fill: C.text,
+        text: `Decode step ${step + 1}: compute 1 new token, append, attend` }));
+
+      // ---- The KV cache (amber) holding past K,V ----
+      svg.appendChild(S("text", { x: cacheX, y: cacheY - 14, "font-size": 12.5,
+        "font-family": "var(--mono)", fill: C.kv, text: "KV cache  (stored K,V — reused, not recomputed)" }));
+      for (let i = 0; i < cachedBefore; i++) {
+        const x = cacheX + i * (cw + cgap);
+        cellLabel(svg, x, cacheY, cw, ch, tokens[i], C.kv, 0.92, "#06121f");
+      }
+      // the appended new K,V slides into the cache
+      const ax = cacheX + cachedBefore * (cw + cgap);
+      const appP = ease(p);
+      cellLabel(svg, ax, cacheY + (1 - appP) * -26, cw, ch, tokens[n - 1], C.compute, 0.92, "#06121f");
+      svg.appendChild(S("text", { x: ax + cw / 2, y: cacheY + ch + 18, "text-anchor": "middle",
+        "font-size": 10.5, "font-family": "var(--mono)", fill: C.compute, text: "new K,V", opacity: appP }));
+
+      // ---- new token's Q (only thing computed besides its K,V) ----
+      const qY = 250;
+      svg.appendChild(S("text", { x: cacheX, y: qY - 14, "font-size": 12.5, "font-family": "var(--mono)",
+        fill: C.token, text: "compute ONLY the new token's Q, K, V:" }));
+      cellLabel(svg, cacheX, qY, cw, ch, "Q", C.token, 0.92 * ease(p), "#06121f");
+      cellLabel(svg, cacheX + (cw + cgap), qY, cw, ch, "K", C.compute, 0.92 * ease(p), "#06121f");
+      cellLabel(svg, cacheX + 2 * (cw + cgap), qY, cw, ch, "V", C.compute, 0.92 * ease(p), "#06121f");
+      svg.appendChild(S("text", { x: cacheX + 3 * (cw + cgap) + 8, y: qY + ch / 2 + 4,
+        "font-size": 11.5, "font-family": "var(--mono)", fill: C.muted,
+        text: "→ K,V appended to cache; Q attends over the whole cache" }));
+
+      // ---- attention: single Q row times whole cache ----
+      const scoreX = 560, scoreY = 110;
+      svg.appendChild(S("text", { x: scoreX, y: scoreY - 14, "font-size": 12.5, "font-family": "var(--mono)",
+        fill: C.compute, text: "attention = newQ × cacheᵀ" }));
+      // one row of n score cells (the only computation)
+      for (let i = 0; i < n; i++) {
+        const x = scoreX + i * 30, y = scoreY;
+        cellLabel(svg, x, y, 26, 30, null, C.compute, 0.9 * ease(IOP.clamp(p * 1.3 - i * 0.04, 0, 1)), "#06121f");
+      }
+      svg.appendChild(S("text", { x: scoreX, y: scoreY + 56, "font-size": 11.5, "font-family": "var(--mono)",
+        fill: C.muted, text: `1 row × ${n} keys = ${n} dot products` }));
+      svg.appendChild(S("text", { x: scoreX, y: scoreY + 78, "font-size": 11.5, "font-family": "var(--mono)",
+        fill: C.compute, text: "constant-shaped per step → linear total" }));
+
+      // contrast bars: flat-ish per step
+      const bx = 560, by = 360;
+      for (let s = 0; s <= step; s++) {
+        const nn = startN + s;
+        const hgt = nn * 6;                 // linear, gentle
+        svg.appendChild(S("rect", { x: bx + s * 28, y: by - hgt, width: 20, height: hgt, rx: 3,
+          fill: s === step ? C.compute : "rgba(52,211,153,.45)", opacity: s === step ? ease(p) : 1 }));
+      }
+      svg.appendChild(S("text", { x: bx, y: by + 14, "font-size": 10.5, "font-family": "var(--mono)",
+        fill: C.faint, text: "per-step work — flat & small" }));
+
+      // tiny "vs fig 2" reminder
+      svg.appendChild(S("text", { x: 40, y: 360, "font-size": 11.5, "font-family": "var(--mono)",
+        fill: C.muted, text: "compare Fig 2: no red recompute block here." }));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl3"),
+      caption: document.getElementById("cap3"),
+      captions: [
+        "<b>Step 1 with cache.</b> The cache already holds K,V for the prompt tokens (amber). We compute <span class='k'>only the new token's Q, K, V</span>, append its K,V to the cache, and multiply its single Q row against the whole cache.",
+        "<b>Step 2.</b> Same tiny operation: one new Q,K,V; append; <span class='k'>one Q row</span> over the now-larger cache. No old K,V is ever recomputed — they are simply read back.",
+        "<b>Step 3.</b> The cache grows by one entry each step, but the <b>compute per step stays small and constant-shaped</b> — just <code>n</code> dot products.",
+        "<b>Step 4.</b> Total work is now <span class='k'>linear</span> in sequence length, not quadratic. The cost moved from compute into memory: we pay in cache size to skip the recompute. That is the KV cache's core trade.",
+      ],
+      render,
+      dwell: 1900,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 4 — KV cache memory growth (Loop) =======
+  (function () {
+    const svg = document.getElementById("svg4");
+    const { S, C, clear } = IOP;
+
+    // Illustrative model config (small but realistic-shaped numbers).
+    const LAYERS = 32, HEADS = 32, DHEAD = 128, BYTES = 2; // fp16
+    const PERTOK = LAYERS * HEADS * 2 * DHEAD * BYTES;      // bytes / token (all layers/heads)
+    const CAP_TOKENS = 64;                                  // illustrative cache cap (max size)
+
+    // bar geometry
+    const barX = 70, barY = 90, barW = 780, barH = 60;
+
+    function fmtKB(bytes) {
+      const kb = bytes / 1024;
+      if (kb >= 1024) return (kb / 1024).toFixed(2) + " MB";
+      return kb.toFixed(0) + " KB";
+    }
+
+    function render(t) {
+      clear(svg);
+
+      // sequence length cycles 0..~80 so we cross the cap and show eviction
+      const period = 12;                                   // seconds per cycle
+      const phase = (t % period) / period;                 // 0..1
+      const maxTok = 80;
+      const seqLen = Math.floor(phase * maxTok);
+      const overCap = seqLen > CAP_TOKENS;
+      const heldTokens = Math.min(seqLen, CAP_TOKENS);     // actually resident after eviction
+      const usedBytes = heldTokens * PERTOK;
+      const capBytes = CAP_TOKENS * PERTOK;
+
+      // title
+      svg.appendChild(S("text", { x: 40, y: 34, "font-size": 13, "font-weight": 700,
+        "font-family": "var(--font)", fill: C.text,
+        text: `Generating… sequence length = ${seqLen} tokens` }));
+      svg.appendChild(S("text", { x: 40, y: 58, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.muted, text: "each new token appends K,V in every head of every layer" }));
+
+      // free HBM background
+      svg.appendChild(S("rect", { x: barX, y: barY, width: barW, height: barH, rx: 10,
+        fill: C.mem, opacity: 0.14, stroke: C.mem, "stroke-opacity": 0.4 }));
+
+      // filled KV portion (relative to cap)
+      const fillFrac = Math.min(heldTokens / CAP_TOKENS, 1);
+      const fillW = barW * fillFrac;
+      svg.appendChild(S("rect", { x: barX, y: barY, width: Math.max(fillW, 0.001), height: barH, rx: 10,
+        fill: C.kv, opacity: 0.92 }));
+
+      // cap marker
+      svg.appendChild(S("line", { x1: barX + barW, y1: barY - 8, x2: barX + barW, y2: barY + barH + 8,
+        stroke: C.faint, "stroke-width": 1.5, "stroke-dasharray": "4 4" }));
+      svg.appendChild(S("text", { x: barX + barW, y: barY - 14, "text-anchor": "end", "font-size": 11,
+        "font-family": "var(--mono)", fill: C.faint, text: `max size = ${CAP_TOKENS} tok (${fmtKB(capBytes)})` }));
+
+      // over-cap → eviction banner
+      if (overCap) {
+        svg.appendChild(S("rect", { x: barX, y: barY, width: barW, height: barH, rx: 10,
+          fill: "none", stroke: C.warn, "stroke-width": 2 }));
+        // evicted ghost block at the front (attention-sink tokens at risk)
+        svg.appendChild(S("rect", { x: barX, y: barY, width: 70, height: barH, rx: 10,
+          fill: C.warn, opacity: 0.35 }));
+        svg.appendChild(S("text", { x: barX + 8, y: barY + barH + 26, "font-size": 11.5,
+          "font-family": "var(--mono)", fill: C.warn,
+          text: `over cap → evict oldest tokens (beware attention sinks!)` }));
+      } else {
+        svg.appendChild(S("text", { x: barX, y: barY + barH + 26, "font-size": 11.5,
+          "font-family": "var(--mono)", fill: C.muted, text: "cache fills linearly with the sequence" }));
+      }
+
+      // current usage readout
+      svg.appendChild(S("text", { x: barX, y: barY - 14, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.kv, text: `KV cache: ${fmtKB(usedBytes)}` }));
+
+      // ---- size intuition box ----
+      const ix = 70, iy = 210;
+      svg.appendChild(S("rect", { x: ix, y: iy, width: 500, height: 96, rx: 10,
+        fill: C.panel, stroke: C.border }));
+      svg.appendChild(S("text", { x: ix + 16, y: iy + 26, "font-size": 12.5, "font-weight": 700,
+        "font-family": "var(--font)", fill: C.text, text: "per-token cache size" }));
+      svg.appendChild(S("text", { x: ix + 16, y: iy + 50, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.kv, text: "layers × heads × 2(K,V) × d_head × bytes" }));
+      svg.appendChild(S("text", { x: ix + 16, y: iy + 72, "font-size": 12, "font-family": "var(--mono)",
+        fill: C.muted, text: `${LAYERS} × ${HEADS} × 2 × ${DHEAD} × ${BYTES}B = ${fmtKB(PERTOK)} / token` }));
+
+      // ---- MQA/GQA/MLA shrink note ----
+      const sx = 600, sy = 210;
+      svg.appendChild(S("rect", { x: sx, y: sy, width: 250, height: 96, rx: 10,
+        fill: "rgba(167,139,250,.08)", stroke: "rgba(167,139,250,.30)" }));
+      svg.appendChild(S("text", { x: sx + 14, y: sy + 24, "font-size": 11, "font-family": "var(--mono)",
+        fill: C.weight, "letter-spacing": "1px", text: "MODULE 1 LINK" }));
+      svg.appendChild(S("text", { x: sx + 14, y: sy + 48, "font-size": 12, "font-family": "var(--font)",
+        fill: C.text, text: "MQA / GQA / MLA cut" }));
+      svg.appendChild(S("text", { x: sx + 14, y: sy + 68, "font-size": 12, "font-family": "var(--font)",
+        fill: C.text, text: "the heads factor →" }));
+      svg.appendChild(S("text", { x: sx + 14, y: sy + 88, "font-size": 12, "font-weight": 700,
+        "font-family": "var(--font)", fill: C.kv, text: "smaller cache." }));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl4"), render, autoplay: true, speed: 1 });
+  })();
+  </script>
+</body>
+</html>

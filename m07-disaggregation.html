@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prefill-Decode Scheduling and Disaggregation — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;7 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/disaggregation/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 7 · Scheduling &amp; placement</div>
+      <h1>Prefill-Decode Scheduling and Disaggregation</h1>
+      <p class="lead">Prefill and decode are two completely different workloads sharing one GPU. This page animates why they fight when co-located, how <b>chunked prefill</b> tames the interference, and how <b>prefill-decode disaggregation</b> splits them onto separate worker pools — shipping the KV cache between them.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Stepper: two phases, two profiles ================= -->
+    <section class="figure">
+      <header>
+        <h3>Two phases, two bottlenecks</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Prefill is <b>compute-bound</b> — one big parallel pass that saturates the math units. Decode is <b>memory-bandwidth-bound</b> — one token at a time, dominated by re-reading weights and the KV cache.</p>
+
+      <div class="stage">
+        <svg id="svgA" viewBox="0 0 920 360" role="img" aria-label="Resource profile of prefill versus decode"></svg>
+      </div>
+
+      <div id="ctrlA"></div>
+      <div id="capA" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> prefill work (compute-bound)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> decode work (bandwidth-bound)</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV cache</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>For a single request, prefill <em>must</em> finish before decode can begin. But across many requests a scheduler is free to choose the order. Prioritizing prefill or mixing prefill and decode in one batch raises <strong>throughput</strong> — at the cost of <strong>latency</strong>, because the in-flight decodes get slowed or stalled. The next figure shows that collision, and the fix.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Stepper: interference & chunked prefill ================= -->
+    <section class="figure">
+      <header>
+        <h3>The interference problem → chunked prefills</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">In a shared continuous batch a long prefill <b>hogs an iteration</b> and stalls the running decodes, spiking inter-token latency (TBT). <b>Chunked prefill</b> (Sarathi) splits that prefill into smaller pieces interleaved with decode steps, bounding the delay.</p>
+
+      <div class="stage">
+        <svg id="svgB" viewBox="0 0 920 380" role="img" aria-label="Co-located interference versus chunked prefill timeline"></svg>
+      </div>
+
+      <div id="ctrlB"></div>
+      <div id="capB" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> prefill iteration</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> decode step (one token)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> stalled decode / latency spike</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Tradeoff</span>
+      Chunking isn't free. Prefill is naturally one parallel pass; cutting it into pieces operates on <b>smaller matrices</b> (harder to saturate the GPU) and re-fetches weights and re-touches the KV cache each chunk (more bandwidth pressure). Make the chunks too small and prefill itself turns memory-bound — throughput falls. The chunk size is tuned to the largest token count the GPU can run while still hitting its SLO, given the decodes already in the batch.
+    </div>
+
+    <!-- ================= FIGURE 3 — Stepper: disaggregation & KV handoff ================= -->
+    <section class="figure">
+      <header>
+        <h3>Prefill-decode disaggregation: the KV handoff</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">DistServe goes further: run prefill and decode on <b>separate worker pools</b>. A prefill pool computes the prompt's KV cache, ships it over the interconnect to a decode pool, which streams out tokens. No more interference, and each pool can use its own hardware and parallelism.</p>
+
+      <div class="stage">
+        <svg id="svgC" viewBox="0 0 920 380" role="img" aria-label="Prefill pool computing KV cache and transferring it to a decode pool"></svg>
+      </div>
+
+      <div id="ctrlC"></div>
+      <div id="capC" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> prefill pool (compute)</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV cache in transit</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> decode pool (bandwidth)</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> streamed token</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Most systems co-locate the two phases so that one copy of the model weights and the KV cache can be <strong>reused</strong> in precious HBM. Disaggregation flips that: it <strong>replicates the weights</strong> across pools and moves the KV cache instead. That sounds expensive, but moving a request's KV — within a node or over a low-latency interconnect — is far faster than prefill or decode, so request latency barely moves (DistServe reports ~0.1% impact, p95 &lt; 30&nbsp;ms). DistServe <em>pulls</em> the KV from the prefill node's memory; Splitwise <em>overlaps</em> transfer with prefill by shipping each layer's KV as it's computed.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — Loop: independent scaling tradeoff ================= -->
+    <section class="figure">
+      <header>
+        <h3>The tradeoff: isolation &amp; scaling vs. KV bandwidth</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Each pool scales independently to match demand, and can sit on the hardware best suited to it (decode = lots of memory, little compute). The cost is a steady stream of KV cache crossing the interconnect between them.</p>
+      <div class="stage">
+        <svg id="svgD" viewBox="0 0 920 320" role="img" aria-label="Independently scaled prefill and decode pools with KV cache flowing between them"></svg>
+      </div>
+      <div id="ctrlD"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> prefill instances</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV transfer (the cost)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> decode instances</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Disaggregation buys clean isolation, simpler scheduling (no prefill-vs-decode prioritization to balance), better tail latency, and the freedom to scale and place each pool independently — at the price of replicated weights and KV cache moving over the network. It is one of several promising disaggregation targets; even <strong>attention vs. the feed-forward network</strong> have different enough profiles to be split in future.</p>
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m06-speculative.html"><span class="dir">← Previous</span><span class="ttl">Speculative Decoding</span></a>
+      <a class="next" href="m08-kvoffload.html"><span class="dir">Next →</span><span class="ttl">KV Cache Management and Offload</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  // ===================== FIGURE 1 — Stepper: two phases, two profiles =====================
+  (function () {
+    const svg = document.getElementById("svgA");
+    const { S, C, clear, lerp, ease, rr } = IOP;
+
+    // layout: left panel = PREFILL, right panel = DECODE, bottom = resource meters
+    const panel = { y: 26, h: 168 };
+    const left  = { x: 40,  w: 400 };
+    const right = { x: 480, w: 400 };
+
+    function gpuTile(x, y, w, h, fillFrac, color, label) {
+      const g = S("g");
+      g.appendChild(S("rect",{x,y,width:w,height:h,rx:7,fill:C.panel,stroke:C.border}));
+      // fill bar = how saturated the math units are
+      const fh = (h-10) * IOP.clamp(fillFrac,0,1);
+      g.appendChild(S("rect",{x:x+5,y:y+5+(h-10-fh),width:w-10,height:fh,rx:5,fill:color,opacity:.9}));
+      if (label) g.appendChild(S("text",{x:x+w/2,y:y+h+16,"text-anchor":"middle",class:"svg-label",text:label}));
+      return g;
+    }
+
+    function meter(x, y, w, frac, color, label) {
+      const g = S("g");
+      g.appendChild(S("text",{x,y:y-6,class:"svg-label",text:label}));
+      g.appendChild(S("rect",{x,y,width:w,height:14,rx:7,fill:C.raised,stroke:C.borderSoft}));
+      g.appendChild(S("rect",{x,y,width:Math.max(2,w*IOP.clamp(frac,0,1)),height:14,rx:7,fill:color}));
+      return g;
+    }
+
+    function render(step, p) {
+      clear(svg);
+      const ep = p;
+
+      // headers
+      svg.appendChild(S("text",{x:left.x, y:18, class:"svg-title", fill:C.weight, text:"PREFILL  ·  compute-bound"}));
+      svg.appendChild(S("text",{x:right.x, y:18, class:"svg-title", fill:C.compute, text:"DECODE  ·  bandwidth-bound"}));
+      svg.appendChild(S("line",{x1:460,y1:24,x2:460,y2:300,stroke:C.borderSoft,"stroke-dasharray":"3 5"}));
+
+      // ---------- PREFILL side ----------
+      // prompt tokens entering as one parallel batch
+      const nTok = 9;
+      const tShow = (step >= 0) ? (step === 0 ? Math.round(nTok*ep) : nTok) : 0;
+      for (let i=0;i<nTok;i++){
+        const tx = left.x + 6 + i*((left.w-12)/nTok);
+        const on = i < tShow;
+        svg.appendChild(S("rect",{x:tx, y:panel.y, width:(left.w-12)/nTok-6, height:22, rx:4,
+          fill: on? C.token : C.raised, opacity: on? .9 : .35}));
+      }
+      svg.appendChild(S("text",{x:left.x, y:panel.y-6, class:"svg-label", text:"whole prompt — all tokens at once"}));
+
+      // GPU math-unit grid: prefill lights it up densely
+      const gx = left.x, gy = panel.y+40, cols=8, rows=4, cw=(left.w)/cols, ch=24;
+      const prefillSat = step===0 ? 0.35+0.6*ep : 0.95;
+      for (let r=0;r<rows;r++) for (let c=0;c<cols;c++){
+        const idx=r*cols+c;
+        const lit = idx < Math.round(prefillSat*cols*rows);
+        svg.appendChild(S("rect",{x:gx+c*cw+2, y:gy+r*ch+2, width:cw-4, height:ch-4, rx:3,
+          fill: lit? C.weight : C.raised, opacity: lit? .85 : .4}));
+      }
+      svg.appendChild(S("text",{x:gx, y:gy+rows*ch+16, class:"svg-label", text:"GPU math units: saturated"}));
+
+      // ---------- DECODE side ----------
+      // one token at a time; emphasize weights + KV re-reads
+      const dStep = step; // which token we are on conceptually
+      const slot = right.x + 6;
+      // single active token
+      const tokPulse = step>=1 ? (0.5+0.5*Math.sin((step+ep)*3.1)) : ep;
+      svg.appendChild(S("rect",{x:slot, y:panel.y, width:(right.w-12)/nTok-6, height:22, rx:4,
+        fill:C.token, opacity:.95}));
+      svg.appendChild(S("text",{x:right.x, y:panel.y-6, class:"svg-label", text:"one token at a time (serial)"}));
+      // greyed future tokens
+      for (let i=1;i<nTok;i++){
+        const tx = right.x + 6 + i*((right.w-12)/nTok);
+        svg.appendChild(S("rect",{x:tx, y:panel.y, width:(right.w-12)/nTok-6, height:22, rx:4, fill:C.raised, opacity:.3}));
+      }
+
+      // decode bottleneck = reading big weights + KV from memory; tiny compute used
+      const gxr = right.x, gyr = panel.y+40;
+      const decodeSat = 0.18; // barely uses math units
+      for (let r=0;r<rows;r++) for (let c=0;c<cols;c++){
+        const idx=r*cols+c;
+        const lit = idx < Math.round(decodeSat*cols*rows);
+        svg.appendChild(S("rect",{x:gxr+c*cw+2, y:gyr+r*ch+2, width:cw-4, height:ch-4, rx:3,
+          fill: lit? C.compute : C.raised, opacity: lit? .85 : .4}));
+      }
+      svg.appendChild(S("text",{x:gxr, y:gyr+rows*ch+16, class:"svg-label", text:"GPU math units: mostly idle"}));
+
+      // memory-traffic arrows for decode (weights + KV streaming in) — animate on step>=1
+      if (step>=1){
+        const flow = (Math.sin((step+ep)*4)+1)/2;
+        for (let k=0;k<3;k++){
+          const ay = gyr + 8 + k*28;
+          const fx = right.x + ((k*0.27+flow)%1)*(right.w-30);
+          svg.appendChild(S("rect",{x:fx, y:ay, width:18, height:8, rx:3, fill: k===2? C.kv : C.weight, opacity:.85}));
+        }
+        svg.appendChild(S("text",{x:gxr, y:gyr-8, class:"svg-label", text:"streaming weights + KV from memory →"}));
+      }
+
+      // ---------- resource meters (the punchline) ----------
+      const my = 250;
+      const compFrac = step<=0 ? (0.35+0.6*ep) : 0.95;     // prefill compute high
+      const decBwFrac = step>=1 ? (0.9) : 0.15;             // decode bandwidth high
+      svg.appendChild(meter(left.x, my, left.w, compFrac, C.weight, "compute utilization"));
+      svg.appendChild(meter(left.x, my+44, left.w, 0.3, C.mem, "memory bandwidth"));
+      svg.appendChild(meter(right.x, my, right.w, 0.18, C.weight, "compute utilization"));
+      svg.appendChild(meter(right.x, my+44, right.w, decBwFrac, C.mem, "memory bandwidth"));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlA"),
+      caption:  document.getElementById("capA"),
+      captions: [
+        "<b>Prefill</b> ingests the <span class='k'>whole prompt in one parallel pass</span>. Even a single long prompt saturates the GPU's math units — it is <span class='k'>compute-bound</span>. Compute utilization is high, memory bandwidth is not the limit.",
+        "<b>Decode</b> emits <span class='k'>one token at a time</span>, serially. Each step is dominated by streaming the model weights and KV cache out of memory, so it is <span class='k'>memory-bandwidth-bound</span> and can't saturate the GPU's math units.",
+        "Same hardware, <b>opposite bottlenecks</b>: prefill pegs <span class='k'>compute</span>, decode pegs <span class='k'>memory bandwidth</span>. That mismatch is the whole reason scheduling and disaggregation matter.",
+      ],
+      render,
+      dwell: 2200,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 2 — Stepper: interference & chunked prefill =====================
+  (function () {
+    const svg = document.getElementById("svgB");
+    const { S, C, clear } = IOP;
+
+    // timeline of iterations along x. Each iteration = one block.
+    const T = { x: 40, y0: 70, lane: 30, w: 840 };
+    const iterW = 56, gap = 8;
+
+    function lane(label, y, color){
+      const g = S("g");
+      g.appendChild(S("text",{x:T.x-6, y:y+20, "text-anchor":"end", class:"svg-label", text:label, fill:color}));
+      g.appendChild(S("line",{x1:T.x, y1:y+28, x2:T.x+T.w, y2:y+28, stroke:C.borderSoft}));
+      return g;
+    }
+
+    function block(x,y,w,h,color,label,op){
+      const g=S("g");
+      g.appendChild(S("rect",{x,y,width:w,height:h,rx:5,fill:color,opacity:op==null?.9:op}));
+      if(label) g.appendChild(S("text",{x:x+w/2,y:y+h/2+4,"text-anchor":"middle",class:"svg-label",fill:"#06121f",text:label}));
+      return g;
+    }
+
+    // step 0: co-located, decode runs smoothly
+    // step 1: a long prefill arrives, occupies one giant iteration, decodes stall (red)
+    // step 2: latency spike shown on a TBT bar
+    // step 3: chunked prefill — prefill split into chunks interleaved with decode, bounded latency
+    function render(step, p){
+      clear(svg);
+      const yP = 60, yD = 150;   // prefill lane y, decode lane y
+      svg.appendChild(lane("prefill", yP, C.weight));
+      svg.appendChild(lane("decode", yD, C.compute));
+      svg.appendChild(S("text",{x:T.x, y:30, class:"svg-title", text: step<3 ? "Co-located in one continuous batch" : "Chunked prefill — interleaved"}));
+
+      // axis caption
+      svg.appendChild(S("text",{x:T.x, y:T.y0+250, class:"svg-label", text:"iterations / time  →"}));
+
+      const baseY_P = yP, baseY_D = yD;
+
+      if (step < 3){
+        // ----- co-located timeline -----
+        // a few normal decode iterations, then a big prefill, then decode resumes
+        let x = T.x + 6;
+        const seq = []; // {kind, span}
+        // 3 normal decode iters
+        for(let i=0;i<3;i++) seq.push({kind:"d", span:1});
+        // big prefill (long prompt) appears at step>=1, span 4
+        seq.push({kind:"P", span: step>=1?4:1});
+        for(let i=0;i<4;i++) seq.push({kind:"d", span:1});
+
+        seq.forEach((s,i)=>{
+          const w = iterW*s.span + gap*(s.span-1);
+          if (s.kind==="d"){
+            // decode block (steady token)
+            svg.appendChild(block(x, baseY_D, iterW, 22, C.compute, "tok", .9));
+          } else {
+            // prefill block (possibly huge)
+            const grow = step>=1 ? (i===3? p:1) : 1;
+            const ww = iterW + (w-iterW)*grow;
+            svg.appendChild(block(x, baseY_P, ww, 22, C.weight, step>=1?"LONG PREFILL":"prefill", .92));
+            // while it runs, the decode lane below is BLOCKED (red bar) for its width
+            if (step>=1){
+              svg.appendChild(S("rect",{x, y:baseY_D, width:ww, height:22, rx:5, fill:C.warn, opacity:.28*p}));
+              if (p>0.5) svg.appendChild(S("text",{x:x+ww/2, y:baseY_D+15, "text-anchor":"middle", class:"svg-label", fill:C.warn, text:"decodes stalled"}));
+            }
+            x += (ww - iterW);
+          }
+          x += iterW + gap;
+        });
+
+        // ----- TBT (inter-token latency) chart at bottom -----
+        const cy = 240, cx = T.x, cw = T.w;
+        svg.appendChild(S("text",{x:cx, y:cy-8, class:"svg-label", text:"inter-token latency (TBT) per token"}));
+        svg.appendChild(S("line",{x1:cx, y1:cy+60, x2:cx+cw, y2:cy+60, stroke:C.borderSoft}));
+        const bars = [12,12,12, step>=1? (12+46*p):12, 12,12,12]; // one giant spike when prefill lands
+        const bw = 30;
+        bars.forEach((h,i)=>{
+          const bx = cx + 30 + i*70;
+          const spike = (i===3 && step>=1);
+          svg.appendChild(S("rect",{x:bx, y:cy+60-h, width:bw, height:h, rx:3, fill: spike? C.warn : C.compute, opacity:.9}));
+        });
+        if (step>=2){
+          svg.appendChild(S("text",{x:cx+30+3*70+bw/2, y:cy+60-(12+46*p)-6, "text-anchor":"middle", class:"svg-label", fill:C.warn, text:"latency spike"}));
+        }
+
+      } else {
+        // ----- step 3: chunked prefill -----
+        // same long prefill, but split into 4 chunks interleaved with decode steps
+        let x = T.x + 6;
+        // pattern: d, [chunk d] x4, d   -> prefill broken into chunks, a decode between each
+        const seq = [
+          {k:"d"}, {k:"c",n:1}, {k:"d"}, {k:"c",n:2}, {k:"d"}, {k:"c",n:3}, {k:"d"}, {k:"c",n:4}, {k:"d"}, {k:"d"}
+        ];
+        seq.forEach((s,i)=>{
+          if (s.k==="d"){
+            svg.appendChild(block(x, baseY_D, iterW, 22, C.compute, "tok", .9));
+          } else {
+            // small prefill chunk
+            svg.appendChild(block(x, baseY_P, iterW, 22, C.weight, "chunk "+s.n, .92));
+            // and a decode shares the same iteration (mixed batch) -> shown directly below, NOT stalled
+            svg.appendChild(block(x, baseY_D, iterW, 22, C.compute, "tok", .9));
+          }
+          x += iterW + gap;
+        });
+        // bounded TBT chart
+        const cy = 240, cx = T.x, cw = T.w;
+        svg.appendChild(S("text",{x:cx, y:cy-8, class:"svg-label", text:"inter-token latency (TBT) per token — bounded"}));
+        svg.appendChild(S("line",{x1:cx, y1:cy+60, x2:cx+cw, y2:cy+60, stroke:C.borderSoft}));
+        // SLO ceiling line
+        const slo = cy+60-34;
+        svg.appendChild(S("line",{x1:cx, y1:slo, x2:cx+cw, y2:slo, stroke:C.kv, "stroke-dasharray":"4 4", opacity:.8}));
+        svg.appendChild(S("text",{x:cx+cw, y:slo-4, "text-anchor":"end", class:"svg-label", fill:C.kv, text:"SLO ceiling"}));
+        const bars = [12,20,18,22,20,22,20, 12,12,12];
+        const bw = 24;
+        bars.forEach((h,i)=>{
+          const bx = cx + 24 + i*64;
+          svg.appendChild(S("rect",{x:bx, y:cy+60-h, width:bw, height:h, rx:3, fill: C.compute, opacity:.9}));
+        });
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlB"),
+      caption:  document.getElementById("capB"),
+      captions: [
+        "Baseline: in a <b>continuous batch</b>, decode steps tick along, each emitting one token at a steady inter-token latency.",
+        "A request with a <b>long prompt</b> arrives. Its prefill grabs an entire iteration — and because the batch is shared, the in-flight <span class='k'>decodes stall</span> behind it.",
+        "The stalled tokens produce a <b>latency spike</b> — a jump in inter-token latency (TBT). One big prefill punishes every user mid-stream.",
+        "<b>Chunked prefill</b> (Sarathi): split the long prefill into small <span class='k'>chunks</span> and interleave them with decode steps in mixed batches. Each iteration stays small, so the <span class='k'>decode latency is bounded</span> under the SLO.",
+      ],
+      render,
+      dwell: 2400,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 3 — Stepper: disaggregation & KV handoff =====================
+  (function () {
+    const svg = document.getElementById("svgC");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    const PP = { x: 40,  y: 70, w: 300, h: 200 };   // prefill pool box
+    const DP = { x: 580, y: 70, w: 300, h: 200 };   // decode pool box
+
+    function poolBox(b, title, color){
+      const g = S("g");
+      g.appendChild(S("rect",{x:b.x, y:b.y, width:b.w, height:b.h, rx:12, fill:C.panel, stroke:color, "stroke-width":1.5, opacity:.95}));
+      g.appendChild(S("text",{x:b.x+14, y:b.y+24, class:"svg-title", fill:color, text:title}));
+      return g;
+    }
+    function worker(x,y,w,h,color,frac){
+      const g=S("g");
+      g.appendChild(S("rect",{x,y,width:w,height:h,rx:6,fill:C.raised,stroke:C.border}));
+      const fh=(h-8)*IOP.clamp(frac,0,1);
+      g.appendChild(S("rect",{x:x+4,y:y+4+(h-8-fh),width:w-8,height:fh,rx:4,fill:color,opacity:.85}));
+      return g;
+    }
+
+    function render(step, p){
+      clear(svg);
+
+      // headline
+      svg.appendChild(S("text",{x:PP.x, y:30, class:"svg-title", text:"Separate worker pools — replicated weights, one shared request"}));
+
+      // pool boxes
+      svg.appendChild(poolBox(PP, "PREFILL POOL", C.weight));
+      svg.appendChild(poolBox(DP, "DECODE POOL", C.compute));
+      // own-parallelism note
+      svg.appendChild(S("text",{x:PP.x+14, y:PP.y+PP.h+20, class:"svg-label", text:"own hardware & parallelism"}));
+      svg.appendChild(S("text",{x:DP.x+14, y:DP.y+DP.h+20, class:"svg-label", text:"memory-heavy, fewer cores"}));
+
+      // prefill workers (2x2) light up as they compute the prompt
+      const wsz = 56, pad=18;
+      const pComputing = (step===0) ? p : (step>=1?1:0);
+      for(let r=0;r<2;r++)for(let c=0;c<2;c++){
+        const wx=PP.x+30+c*(wsz+pad), wy=PP.y+44+r*(wsz+pad);
+        worker_call(wx,wy);
+        function worker_call(wx,wy){
+          svg.appendChild(worker(wx,wy,wsz,wsz,C.weight, step===0? (0.2+0.7*p) : (step>=1?0.95:0.2)));
+        }
+      }
+      // prompt label on prefill side
+      svg.appendChild(S("text",{x:PP.x+30, y:PP.y+44-6, class:"svg-label", text: step===0? "computing prompt KV…" : "KV cache ready"}));
+
+      // KV cache artifact in prefill memory (appears once computed)
+      const kvReady = step>=1;
+      const kvX0 = PP.x+PP.w-30, kvY = PP.y+PP.h/2-16;
+      if (kvReady){
+        svg.appendChild(S("rect",{x:kvX0, y:kvY, width:24, height:32, rx:4, fill:C.kv, opacity:.95}));
+        if (step===1) svg.appendChild(S("text",{x:kvX0+12, y:kvY-6, "text-anchor":"middle", class:"svg-label", fill:C.kv, text:"KV"}));
+      }
+
+      // ---- the interconnect / transfer ----
+      const midY = PP.y + PP.h/2;
+      svg.appendChild(S("line",{x1:PP.x+PP.w, y1:midY, x2:DP.x, y2:midY, stroke:C.borderSoft, "stroke-dasharray":"4 6"}));
+      svg.appendChild(S("text",{x:(PP.x+PP.w+DP.x)/2, y:midY-14, "text-anchor":"middle", class:"svg-label", text:"interconnect / network"}));
+
+      // moving KV packet(s) during step 2 (transfer)
+      if (step===2){
+        const from = PP.x+PP.w, to = DP.x;
+        for(let k=0;k<3;k++){
+          const tt = IOP.clamp(p*1.2 - k*0.18, 0, 1);
+          const px = lerp(from, to, IOP.ease(tt));
+          svg.appendChild(S("rect",{x:px-12, y:midY-16, width:24, height:32, rx:4, fill:C.kv, opacity: (tt>0 && tt<1) ? 0.95 : 0.0}));
+        }
+        svg.appendChild(S("text",{x:(from+to)/2, y:midY+30, "text-anchor":"middle", class:"svg-label", fill:C.kv, text:"shipping KV cache  (fast: far less than prefill)"}));
+      }
+
+      // KV landed in decode pool from step 3
+      if (step>=3){
+        const kvD = DP.x+18;
+        svg.appendChild(S("rect",{x:kvD, y:DP.y+DP.h/2-16, width:24, height:32, rx:4, fill:C.kv, opacity:.95}));
+      }
+
+      // decode workers stream tokens from step 3
+      const dActive = step>=3;
+      for(let r=0;r<2;r++)for(let c=0;c<2;c++){
+        const wx=DP.x+70+c*(wsz+pad), wy=DP.y+44+r*(wsz+pad);
+        svg.appendChild(worker(wx,wy,wsz,wsz,C.compute, dActive? 0.25 : 0.08)); // little compute used
+      }
+      if (dActive){
+        // streamed tokens flying out to the right
+        const flow = (Math.sin(p*6)+1)/2;
+        for(let i=0;i<5;i++){
+          const tx = DP.x+DP.w-20 + ((i*0.22+flow)%1)*120;
+          svg.appendChild(S("rect",{x:tx, y:DP.y+DP.h/2-8, width:16, height:16, rx:4, fill:C.token, opacity:.9}));
+        }
+        svg.appendChild(S("text",{x:DP.x+DP.w-20, y:DP.y+DP.h/2-16, class:"svg-label", fill:C.token, text:"streaming tokens →"}));
+        svg.appendChild(S("text",{x:DP.x+70, y:DP.y+44-6, class:"svg-label", text:"autoregressive decode"}));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlC"),
+      caption:  document.getElementById("capC"),
+      captions: [
+        "The <b>prefill pool</b> takes the request and runs the prompt through a replicated copy of the weights, <span class='k'>populating the KV cache</span> — a compute-heavy job, on hardware tuned for it.",
+        "Prefill finishes. The request's <span class='k'>KV cache</span> now sits in the prefill node's memory, ready to hand off.",
+        "The KV cache is <b>shipped over the interconnect</b> to the decode pool. Moving it — within a node or over a low-latency link — is far cheaper than prefill or decode, so latency barely moves (~0.1% impact).",
+        "The <b>decode pool</b> receives the KV and runs the <span class='k'>autoregressive phase</span>, streaming out tokens. The two pools never share an iteration, so there is <span class='k'>no interference</span>.",
+      ],
+      render,
+      dwell: 2400,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 4 — Loop: independent scaling + KV cost =====================
+  (function () {
+    const svg = document.getElementById("svgD");
+    const { S, C, clear } = IOP;
+
+    const PP = { x: 60,  y: 70, w: 250, h: 180 };
+    const DP = { x: 610, y: 70, w: 250, h: 180 };
+
+    function poolBox(b, title, color){
+      const g = S("g");
+      g.appendChild(S("rect",{x:b.x, y:b.y, width:b.w, height:b.h, rx:12, fill:C.panel, stroke:color, "stroke-width":1.5, opacity:.95}));
+      g.appendChild(S("text",{x:b.x+14, y:b.y+24, class:"svg-title", fill:color, text:title}));
+      return g;
+    }
+
+    function render(t){
+      clear(svg);
+
+      // pool counts breathe independently to show "scale to match demand"
+      const nP = 2 + Math.round(1.5 + 1.5*Math.sin(t*0.6));        // 2..5
+      const nD = 2 + Math.round(1.5 + 1.5*Math.sin(t*0.6 + 2.1));  // 2..5 (out of phase)
+
+      svg.appendChild(S("text",{x:PP.x, y:34, class:"svg-title", text:"Each pool scales independently to match demand"}));
+
+      svg.appendChild(poolBox(PP, "PREFILL ×"+nP, C.weight));
+      svg.appendChild(poolBox(DP, "DECODE ×"+nD, C.compute));
+
+      // draw instance tiles in each pool (stacked), pulsing utilization
+      function tiles(b, n, color, phase){
+        const cols = 2, tw=90, th=30, gx=14, gy=10;
+        const startY = b.y+40;
+        for(let i=0;i<n;i++){
+          const r=Math.floor(i/cols), c=i%cols;
+          const x=b.x+14+c*(tw+gx), y=startY+r*(th+gy);
+          if (y+th > b.y+b.h-10) continue;
+          const u = 0.5+0.45*Math.sin(t*2.4 + i*0.9 + phase);
+          svg.appendChild(S("rect",{x,y,width:tw,height:th,rx:6,fill:C.raised,stroke:C.border}));
+          svg.appendChild(S("rect",{x:x+3,y:y+3,width:(tw-6)*IOP.clamp(u,0,1),height:th-6,rx:4,fill:color,opacity:.8}));
+        }
+      }
+      tiles(PP, nP, C.weight, 0);
+      tiles(DP, nD, C.compute, 1.3);
+
+      // interconnect with continuous KV packets crossing = the cost
+      const midY = 165;
+      svg.appendChild(S("line",{x1:PP.x+PP.w, y1:midY, x2:DP.x, y2:midY, stroke:C.borderSoft, "stroke-dasharray":"4 6"}));
+      svg.appendChild(S("text",{x:(PP.x+PP.w+DP.x)/2, y:midY-40, "text-anchor":"middle", class:"svg-label", text:"interconnect"}));
+      const from=PP.x+PP.w, to=DP.x, span=to-from;
+      for(let k=0;k<5;k++){
+        const f = ((t*0.35 + k*0.2) % 1);
+        const px = from + f*span;
+        svg.appendChild(S("rect",{x:px-11, y:midY-15, width:22, height:30, rx:4, fill:C.kv, opacity:.92}));
+      }
+      svg.appendChild(S("text",{x:(from+to)/2, y:midY+34, "text-anchor":"middle", class:"svg-label", fill:C.kv, text:"KV cache crossing the wire — the price of isolation"}));
+
+      // tokens streaming out of decode pool
+      const ox = DP.x+DP.w;
+      for(let i=0;i<5;i++){
+        const f=((t*0.7+i*0.2)%1);
+        svg.appendChild(S("rect",{x:ox+f*48, y:midY-8, width:14, height:14, rx:4, fill:C.token, opacity:.9*(1-f*0.4)}));
+      }
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrlD"), render, autoplay: true, speed: 1 });
+  })();
+  </script>
+</body>
+</html>

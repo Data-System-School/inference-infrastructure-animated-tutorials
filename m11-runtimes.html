@@ -1,0 +1,699 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE 11 / 11 — Appendix: Inference Runtimes (serving stacks)
+     Faithful to https://iop.systems/blog/llm-inference/software/
+     Self-contained: only shared.css + shared.js. Vanilla JS + inline SVG.
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Appendix: Inference Runtimes — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;11 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/software/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Appendix · Module 11</div>
+      <h1>Inference Runtimes: the serving stacks</h1>
+      <p class="lead">A model isn't one giant GPU kernel — it's a graph of kernels (matmul, ReLU,
+      attention) composed and driven by a <em>runtime</em>. This finale tours the production stacks that
+      do that driving — <b>TensorRT&#8209;LLM</b>, <b>Triton</b>, <b>vLLM</b>, and <b>SGLang</b> — and shows how
+      every technique from the series lives inside them.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Stepper: the serving stack ================= -->
+    <section class="figure">
+      <header>
+        <h3>The serving stack: a request's round trip</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Follow one request down the stack — gateway, scheduler, engine, kernels, GPU —
+      and watch generated tokens stream back up.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 430" role="img" aria-label="A request descends through API gateway, router/scheduler, inference engine, optimized kernels, and GPU hardware, then tokens stream back up."></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> request / tokens</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> stack layer · engine</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> GPU execution</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV-cache feature</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>That whole column is what a <strong>runtime</strong> provides. The article splits the field two ways.
+      NVIDIA's stack keeps a clean <strong>frontend / backend</strong> divide — <code>TensorRT(-LLM)</code> is the
+      backend that runs the model on GPUs, and the <code>Triton Inference Server</code> is the frontend that
+      routes and batches requests to backends. The cross-platform stacks — <code>vLLM</code> and
+      <code>SGLang</code> — <em>flatten</em> that divide, providing the network face, the scheduler, and the
+      kernels all in one.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Loop: engine comparison ================= -->
+    <section class="figure">
+      <header>
+        <h3>Four runtimes, four signatures</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Each card pulses its defining trait. They map straight back to earlier modules —
+      paging, prefix caching, kernel fusion, and orchestration.</p>
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 340" role="img" aria-label="Cards for vLLM, SGLang, TensorRT-LLM, and Triton Inference Server, each highlighting its signature optimization in turn."></svg>
+      </div>
+      <div id="ctrl2"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> engine</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV / cache trait</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> kernel / compute trait</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> routing / frontend</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Maps to the series</span>
+      <b>vLLM</b> → PagedAttention &amp; continuous batching (Module&nbsp;4). <b>SGLang</b> → RadixAttention /
+      prefix caching plus a structured frontend (Modules&nbsp;4&amp;8). <b>TensorRT&#8209;LLM</b> → ahead-of-time
+      compiled, fused kernels (Modules&nbsp;5&amp;10). <b>Triton</b> → the orchestration layer that hosts any of
+      these backends.
+    </div>
+
+    <!-- ================= FIGURE 3 — Loop: the engine at work ================= -->
+    <section class="figure">
+      <header>
+        <h3>Inside the engine, at work</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">The whole series in one frame: the scheduler forms a continuous batch, KV lives in
+      paged blocks, a new request hits a prefix-cache, and tokens stream out.</p>
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 380" role="img" aria-label="A scheduler forms a continuous batch from a queue, KV cache is stored in paged blocks, a prefix-cache hit reuses earlier blocks, and decoded tokens stream out."></svg>
+      </div>
+      <div id="ctrl3"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> request · token</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> paged KV block</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> GPU step (decode)</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> prefix-cache hit</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>One last distinction the article draws: <strong>when</strong> the optimization happens.
+      TensorRT does it <em>ahead of time</em> in a one-time compile — analyse the graph, pick kernels, fuse
+      ops, quantize for the target GPU. vLLM and SGLang have no explicit compile step; they optimize a
+      little <em>at startup</em> (a kernel pipeline they cache and reuse, optionally via
+      <code>torch.compile</code>) and spend the rest of their effort on <em>runtime</em> scheduling. Same goal,
+      different split between static and dynamic.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — Stepper: compile-time vs runtime ================= -->
+    <section class="figure">
+      <header>
+        <h3>Static vs dynamic: where the optimization lives</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">A model's journey to served tokens crosses two regimes — an offline compile phase
+      and an online scheduling phase. Engines sit at different points along that line.</p>
+
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 400" role="img" aria-label="A timeline split into a compile-time region (graph capture, kernel fusion, quantization) and a runtime region (scheduling, batching, paging), with engines placed along it."></svg>
+      </div>
+
+      <div id="ctrl4"></div>
+      <div id="cap4" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> compile-time (static)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> kernel work</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> runtime (dynamic)</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> per-request state</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Series wrap-up</span>
+      Across eleven modules you've gone from a single attention head to a full serving stack. A
+      <b>transformer</b> (M1) becomes tractable with the <b>KV cache</b> (M2); <b>sharding</b> (M3) spreads it
+      across GPUs; <b>batching, paging &amp; scheduling</b> (M4), <b>I/O-aware kernels</b> (M5),
+      <b>speculative decoding</b> (M6), <b>prefill/decode disaggregation</b> (M7), and <b>KV offload</b> (M8)
+      each claw back latency and memory. The runtimes here — <b>TensorRT&#8209;LLM, Triton, vLLM, SGLang</b> —
+      are where all of it ships as one system. That's the stack.
+    </div>
+
+    <!-- ----- prev / next ----- -->
+    <nav class="pager">
+      <a class="prev" href="m10-hardware.html"><span class="dir">← Previous</span><span class="ttl">Appendix: GPU Hardware</span></a>
+      <a class="next" href="index.html"><span class="dir">Series complete · Next →</span><span class="ttl">↩ Back to the hub</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Final module of the series. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  /* ============================================================= *
+   *  FIGURE 1 — Stepper: the serving stack round-trip            *
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg1");
+    const { S, C, clear, lerp, ease, rr } = IOP;
+
+    const W = 920;
+    // Five stack layers, top (network) to bottom (silicon).
+    const layers = [
+      { name: "API gateway",        sub: "OpenAI-compatible HTTP",        color: C.token },
+      { name: "Router / scheduler", sub: "queue · continuous batching",   color: C.kv },
+      { name: "Inference engine",   sub: "vLLM · SGLang · TensorRT-LLM",  color: C.weight },
+      { name: "Optimized kernels",  sub: "FlashAttention · fused matmul", color: C.compute },
+      { name: "GPU hardware",       sub: "SMs · HBM (Module 10)",          color: C.mem },
+    ];
+    const N = layers.length;
+    const boxX = 250, boxW = 420, boxH = 52, gap = 20;
+    const top = 36;
+    const rowY = (i) => top + i * (boxH + gap);
+
+    function layerBox(i, hot) {
+      const y = rowY(i), L = layers[i];
+      const g = S("g", {});
+      g.appendChild(S("path", {
+        d: rr(boxX, y, boxW, boxH, 11),
+        fill: hot ? L.color : C.card,
+        opacity: hot ? 0.22 : 1,
+        stroke: hot ? L.color : C.border,
+        "stroke-width": hot ? 2 : 1.2,
+      }));
+      g.appendChild(S("rect", { x: boxX, y: y + 9, width: 5, height: boxH - 18, rx: 2.5, fill: L.color, opacity: hot ? 1 : 0.7 }));
+      g.appendChild(S("text", { x: boxX + 18, y: y + 22, class: "svg-title", text: L.name }));
+      g.appendChild(S("text", { x: boxX + 18, y: y + 40, class: "svg-label", text: L.sub }));
+      return g;
+    }
+
+    // a moving pill carrying the request / tokens
+    function pill(cx, cy, label, fill) {
+      const w = 86, h = 26;
+      const g = S("g", {});
+      g.appendChild(S("path", { d: rr(cx - w / 2, cy - h / 2, w, h, 13), fill, opacity: 0.95 }));
+      g.appendChild(S("text", { x: cx, y: cy + 4, "text-anchor": "middle",
+        style: "font-family:var(--mono);font-size:11.5px;font-weight:700;fill:#06121f", text: label }));
+      return g;
+    }
+
+    // descending steps 0..4 (enter each layer), then ascending 5..9 (tokens leave).
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(S("text", { x: boxX + boxW / 2, y: 22, "text-anchor": "middle", class: "svg-label",
+        text: step < N ? "▼  request descends" : "▲  tokens stream back" }));
+
+      const descending = step < N;
+      const activeLayer = descending ? step : (2 * N - 1 - step); // mirror on the way up
+      for (let i = 0; i < N; i++) svg.appendChild(layerBox(i, i === activeLayer));
+
+      // connector arrows between boxes
+      for (let i = 0; i < N - 1; i++) {
+        const y1 = rowY(i) + boxH, y2 = rowY(i + 1);
+        const lit = descending ? (i < step) : (i >= activeLayer);
+        svg.appendChild(S("line", { x1: boxX + boxW / 2, y1, x2: boxX + boxW / 2, y2,
+          stroke: lit ? C.accent : C.border, "stroke-width": lit ? 2.5 : 1.5, opacity: lit ? 0.9 : 0.5 }));
+      }
+
+      // the travelling pill
+      let py, label, fill;
+      if (descending) {
+        const fromY = step === 0 ? top - 26 : rowY(step - 1) + boxH / 2;
+        const toY = rowY(step) + boxH / 2;
+        py = lerp(fromY, toY, ease(p));
+        label = "REQUEST"; fill = C.token;
+      } else {
+        const aFrom = (step === N) ? N - 1 : (2 * N - 1 - step) + 1;
+        const fromY = rowY(aFrom) + boxH / 2;
+        const toY = rowY(activeLayer) + boxH / 2;
+        py = lerp(fromY, toY, ease(p));
+        label = "tok"; fill = C.compute;
+      }
+      // For token ascent, draw a little stream of 3 pills
+      if (descending) {
+        svg.appendChild(pill(boxX - 70, py, label, fill));
+        // arrow tip
+        svg.appendChild(S("path", { d: `M${boxX-24},${py} l-10,-5 v10 z`, fill: C.token }));
+      } else {
+        for (let k = 0; k < 3; k++) {
+          const off = k * 22;
+          svg.appendChild(pill(boxX + boxW + 70, py + (k - 1) * 0, label, fill));
+        }
+        // little token glyphs trailing upward to the gateway
+        for (let k = 0; k < 4; k++) {
+          const yy = py + 40 + k * 26;
+          svg.appendChild(S("rect", { x: boxX + boxW + 50 + k * 6, y: yy, width: 14, height: 14, rx: 3,
+            fill: C.compute, opacity: 0.85 - k * 0.18 }));
+        }
+        svg.appendChild(S("path", { d: `M${boxX+boxW+24},${py} l10,-5 v10 z`, fill: C.compute }));
+      }
+
+      // GPU "execution" glow on the silicon layer when we hit bottom
+      if (activeLayer === N - 1) {
+        const gy = rowY(N - 1);
+        for (let s = 0; s < 6; s++) {
+          const t = (p + s / 6) % 1;
+          svg.appendChild(S("rect", { x: boxX + 250 + s * 26, y: gy + 14, width: 16, height: 16, rx: 3,
+            fill: C.compute, opacity: 0.35 + 0.45 * Math.abs(Math.sin((t) * Math.PI)) }));
+        }
+      }
+
+      // side note: which engine label glows on the engine row
+      if (activeLayer === 2) {
+        svg.appendChild(S("text", { x: boxX + boxW + 26, y: rowY(2) + 30, class: "svg-label",
+          style: "fill:" + C.weight, text: "← the runtime" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption:  document.getElementById("cap1"),
+      captions: [
+        "<b>1 · API gateway.</b> A request arrives at the network face — usually an <span class='k'>OpenAI-compatible</span> HTTP endpoint. This is the front door of the serving stack.",
+        "<b>2 · Router / scheduler.</b> The request joins a <span class='k'>queue</span> and is folded into a <span class='k'>continuous batch</span> with other in-flight requests (Module&nbsp;4).",
+        "<b>3 · Inference engine.</b> The <span class='k'>runtime</span> itself — vLLM, SGLang, or TensorRT-LLM — turns the model into a pipeline of kernels and drives execution.",
+        "<b>4 · Optimized kernels.</b> The engine dispatches <span class='k'>hand-tuned kernels</span> — FlashAttention, FlashInfer, fused matmuls — instead of naive ops (Module&nbsp;5).",
+        "<b>5 · GPU hardware.</b> Kernels run on the <span class='k'>SMs</span>, reading weights and KV from HBM (Module&nbsp;10). One forward pass produces the next-token logits.",
+        "<b>6 · Back up: kernels.</b> The sampled token returns through the kernel layer; the engine appends it to the <span class='k'>KV cache</span> and prepares the next step.",
+        "<b>7 · Engine loop.</b> The engine decides: keep decoding this request, or yield the slot. Decoding is a <span class='k'>tight loop</span> of steps 3–6, one token at a time.",
+        "<b>8 · Scheduler.</b> Finished tokens are handed back to the scheduler, which interleaves them with every other request's stream.",
+        "<b>9 · Gateway streams out.</b> Tokens flow back through the gateway to the client as a <span class='k'>token stream</span> — the user sees text appear word by word.",
+      ],
+      render,
+      dwell: 1700,
+      autoplay: false,
+    });
+  })();
+
+
+  /* ============================================================= *
+   *  FIGURE 2 — Loop: four runtimes, four signatures             *
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg2");
+    const { S, C, clear, rr } = IOP;
+
+    const cards = [
+      { name: "vLLM",          tag: "cross-platform engine", trait: "PagedAttention + continuous batching",
+        accent: C.kv,    glyph: "pages" },
+      { name: "SGLang",        tag: "cross-platform engine", trait: "RadixAttention · prefix cache + structured frontend",
+        accent: C.good,  glyph: "radix" },
+      { name: "TensorRT-LLM",  tag: "NVIDIA · AOT compiled", trait: "compiled, fused kernels for the target GPU",
+        accent: C.compute, glyph: "fuse" },
+      { name: "Triton Server", tag: "NVIDIA · orchestration", trait: "frontend that routes/batches to backends",
+        accent: C.token, glyph: "route" },
+    ];
+    const n = cards.length;
+    const cardW = 206, cardH = 230, gap = 22;
+    const totalW = n * cardW + (n - 1) * gap;
+    const x0 = (920 - totalW) / 2;
+    const y0 = 34;
+
+    function drawGlyph(g, kind, cx, cy, accent, ph) {
+      // ph in 0..1 pulse phase
+      if (kind === "pages") {
+        // four KV pages filling
+        for (let i = 0; i < 4; i++) {
+          const lit = ((ph * 4) | 0) >= i;
+          g.appendChild(S("rect", { x: cx - 46 + i * 24, y: cy - 16, width: 18, height: 32, rx: 4,
+            fill: lit ? accent : C.raised, stroke: accent, "stroke-width": 1, opacity: lit ? 0.9 : 0.5 }));
+        }
+      } else if (kind === "radix") {
+        // a prefix tree: shared trunk, branching, hit pulse
+        g.appendChild(S("line", { x1: cx, y1: cy + 22, x2: cx, y2: cy - 2, stroke: accent, "stroke-width": 3 }));
+        g.appendChild(S("line", { x1: cx, y1: cy - 2, x2: cx - 32, y2: cy - 22, stroke: accent, "stroke-width": 2.4 }));
+        g.appendChild(S("line", { x1: cx, y1: cy - 2, x2: cx + 32, y2: cy - 22, stroke: accent, "stroke-width": 2.4 }));
+        g.appendChild(S("circle", { cx, cy: cy + 22, r: 6, fill: accent }));
+        const hit = Math.abs(Math.sin(ph * Math.PI));
+        g.appendChild(S("circle", { cx: cx - 32, cy: cy - 22, r: 5 + 3 * hit, fill: accent, opacity: 0.5 + 0.5 * hit }));
+        g.appendChild(S("circle", { cx: cx + 32, cy: cy - 22, r: 5, fill: C.raised, stroke: accent }));
+      } else if (kind === "fuse") {
+        // three ops collapsing into one fused kernel
+        const sep = (1 - ph) * 30;
+        ["A", "B", "C"].forEach((lab, i) => {
+          const xx = cx + (i - 1) * (16 + sep);
+          g.appendChild(S("rect", { x: xx - 11, y: cy - 11, width: 22, height: 22, rx: 5,
+            fill: ph > 0.85 ? accent : C.raised, stroke: accent, "stroke-width": 1.4, opacity: 0.95 }));
+        });
+        if (ph > 0.85)
+          g.appendChild(S("text", { x: cx, y: cy + 4, "text-anchor": "middle",
+            style: "font-family:var(--mono);font-size:10px;fill:#06121f;font-weight:700", text: "fused" }));
+      } else if (kind === "route") {
+        // one inbox splitting to two backends
+        g.appendChild(S("rect", { x: cx - 8, y: cy - 24, width: 16, height: 16, rx: 3, fill: accent }));
+        const m = ph;
+        [-34, 34].forEach((dx) => {
+          g.appendChild(S("line", { x1: cx, y1: cy - 8, x2: cx + dx, y2: cy + 18, stroke: accent, "stroke-width": 2, opacity: 0.8 }));
+          g.appendChild(S("rect", { x: cx + dx - 11, y: cy + 18, width: 22, height: 16, rx: 3, fill: C.raised, stroke: accent }));
+        });
+        // travelling dot
+        const dx = ph < 0.5 ? -34 : 34;
+        const tt = ph < 0.5 ? ph * 2 : (ph - 0.5) * 2;
+        g.appendChild(S("circle", { cx: cx + dx * tt, cy: cy - 8 + 26 * tt, r: 4, fill: accent }));
+      }
+    }
+
+    function render(t) {
+      clear(svg);
+      // highlight cycles through cards
+      const period = 1.6;
+      const active = Math.floor((t / period) % n);
+      const localPh = ((t / period) % 1);
+
+      for (let i = 0; i < n; i++) {
+        const cx = x0 + i * (cardW + gap);
+        const hot = i === active;
+        const c = cards[i];
+        const g = S("g", {});
+        g.appendChild(S("path", { d: rr(cx, y0, cardW, cardH, 13),
+          fill: C.card, stroke: hot ? c.accent : C.border, "stroke-width": hot ? 2.2 : 1.2 }));
+        if (hot) g.appendChild(S("path", { d: rr(cx, y0, cardW, cardH, 13), fill: c.accent, opacity: 0.07 }));
+
+        // engine name (violet header band per spec: engines = weight)
+        g.appendChild(S("path", { d: rr(cx, y0, cardW, 38, 13), fill: C.weight, opacity: hot ? 0.30 : 0.16 }));
+        g.appendChild(S("rect", { x: cx, y: y0 + 24, width: cardW, height: 14, fill: C.card, opacity: 0 }));
+        g.appendChild(S("text", { x: cx + 16, y: y0 + 25, class: "svg-title", text: c.name }));
+        g.appendChild(S("text", { x: cx + 16, y: y0 + 58, class: "svg-label", text: c.tag }));
+
+        // signature glyph
+        drawGlyph(g, c.glyph, cx + cardW / 2, y0 + 118, c.accent, hot ? localPh : 0.0);
+
+        // trait text, wrapped to two lines
+        const words = c.trait.split(" ");
+        let line1 = "", line2 = "";
+        for (const w of words) {
+          if ((line1 + " " + w).trim().length <= 24) line1 = (line1 + " " + w).trim();
+          else line2 = (line2 + " " + w).trim();
+        }
+        g.appendChild(S("text", { x: cx + 16, y: y0 + 178, class: "svg-label",
+          style: "fill:" + (hot ? C.text : C.muted) + ";font-size:11.5px", text: line1 }));
+        if (line2) g.appendChild(S("text", { x: cx + 16, y: y0 + 195, class: "svg-label",
+          style: "fill:" + (hot ? C.text : C.muted) + ";font-size:11.5px", text: line2 }));
+
+        // accent chip showing what kind of trait it is
+        g.appendChild(S("circle", { cx: cx + cardW - 18, cy: y0 + 19, r: 6, fill: c.accent }));
+
+        svg.appendChild(g);
+      }
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl2"), render, autoplay: true, speed: 1 });
+  })();
+
+
+  /* ============================================================= *
+   *  FIGURE 3 — Loop: inside the engine, at work                 *
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg3");
+    const { S, C, clear, rr, clamp } = IOP;
+
+    // Layout zones
+    //  [queue] -> [scheduler / continuous batch] -> [paged KV grid] -> [token stream]
+    const reqColors = [C.token, C.weight, C.kv, C.good];
+
+    function render(t) {
+      clear(svg);
+
+      // ---- Zone titles ----
+      svg.appendChild(S("text", { x: 80,  y: 26, class: "svg-label", text: "queue" }));
+      svg.appendChild(S("text", { x: 250, y: 26, class: "svg-label", text: "scheduler · continuous batch" }));
+      svg.appendChild(S("text", { x: 560, y: 26, class: "svg-label", text: "paged KV cache" }));
+      svg.appendChild(S("text", { x: 800, y: 26, class: "svg-label", text: "token stream" }));
+
+      // ===== 1. QUEUE: requests waiting, sliding in =====
+      const qx = 50, qy = 56;
+      for (let i = 0; i < 4; i++) {
+        const phase = (t * 0.6 + i * 0.9) % 4;          // each request cycles
+        const inBatch = phase > 1;
+        const yy = qy + i * 40;
+        const slide = clamp(1 - (phase % 1), 0, 1);
+        svg.appendChild(S("path", { d: rr(qx + (inBatch ? 0 : slide * 14), yy, 70, 30, 8),
+          fill: C.card, stroke: reqColors[i], "stroke-width": 1.4, opacity: inBatch ? 0.4 : 1 }));
+        svg.appendChild(S("circle", { cx: qx + 14, cy: yy + 15, r: 6, fill: reqColors[i] }));
+        svg.appendChild(S("text", { x: qx + 28, y: yy + 19, class: "svg-label",
+          style: "font-size:11px", text: "req " + (i + 1) }));
+      }
+
+      // ===== 2. SCHEDULER: a continuous batch (rows fill at different lengths) =====
+      const sx = 250, sy = 50, sw = 250, sh = 230;
+      svg.appendChild(S("path", { d: rr(sx, sy, sw, sh, 12), fill: C.panel, stroke: C.border, "stroke-width": 1.2 }));
+      svg.appendChild(S("text", { x: sx + 14, y: sy + 24, class: "svg-title",
+        style: "font-size:13px", text: "in-flight batch" }));
+
+      // 4 lanes, each a request being decoded at its own length
+      const lanes = 4, laneH = 38, laneTop = sy + 38;
+      for (let i = 0; i < lanes; i++) {
+        const ly = laneTop + i * laneH;
+        // how many tokens generated so far (animated)
+        const gen = ((t * (0.7 + i * 0.15) + i * 1.3) % 9);
+        const filled = Math.floor(gen);
+        const newReq = ((t * 0.6 + i * 0.9) % 4) > 1; // sync-ish with queue
+        for (let k = 0; k < 9; k++) {
+          const cellx = sx + 16 + k * 24;
+          const isPrompt = k < 3;
+          const lit = k < filled;
+          svg.appendChild(S("rect", { x: cellx, y: ly + 6, width: 18, height: 22, rx: 4,
+            fill: lit ? (isPrompt ? reqColors[i] : C.compute) : C.raised,
+            stroke: isPrompt ? reqColors[i] : C.border, "stroke-width": 1,
+            opacity: lit ? 0.9 : 0.45 }));
+        }
+        // the "decode cursor" — current GPU step on this lane
+        const cur = sx + 16 + clamp(filled, 0, 8) * 24 + 9;
+        const pulse = 0.5 + 0.5 * Math.sin(t * 6 + i);
+        svg.appendChild(S("circle", { cx: cur, cy: ly + 17, r: 5 + 2 * pulse, fill: C.compute, opacity: 0.85 }));
+      }
+      svg.appendChild(S("text", { x: sx + 16, y: sy + sh - 8, class: "svg-label",
+        style: "font-size:10.5px", text: "■ prompt   ■ decoded token   ● GPU step" }));
+
+      // ===== 3. PAGED KV GRID: blocks allocated per request; a prefix-cache hit =====
+      const gx = 540, gy = 56, cols = 6, rows = 5, cell = 30, pad = 4;
+      // grid frame
+      svg.appendChild(S("path", { d: rr(gx - 10, gy - 10, cols * cell + 20, rows * cell + 20, 10),
+        fill: C.panel, stroke: C.border, "stroke-width": 1.2 }));
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const idx = r * cols + c;
+          // assign some blocks to requests, leave some free
+          let fill = C.raised, stroke = C.border, op = 0.5;
+          const owner = (idx * 7) % 11;
+          if (owner < 4) {                 // owned KV block
+            fill = reqColors[owner]; stroke = reqColors[owner]; op = 0.82;
+          }
+          // animate a couple of blocks being newly written (amber pulse)
+          const writePulse = Math.sin(t * 2 + idx) > 0.95;
+          if (writePulse && owner < 4) { fill = C.kv; op = 0.95; }
+          const bx = gx + c * cell, by = gy + r * cell;
+          svg.appendChild(S("rect", { x: bx + pad / 2, y: by + pad / 2, width: cell - pad, height: cell - pad, rx: 4,
+            fill, stroke, "stroke-width": 1, opacity: op }));
+        }
+      }
+      // a prefix-cache HIT: two requests sharing the same first blocks -> green ring sweeps
+      const hitOn = (Math.sin(t * 1.1) > 0);
+      if (hitOn) {
+        const ring = (t * 1.1) % 1;
+        // highlight top-left 3 blocks as "shared prefix"
+        for (let c = 0; c < 3; c++) {
+          svg.appendChild(S("rect", { x: gx + c * cell + pad / 2, y: gy + pad / 2, width: cell - pad, height: cell - pad, rx: 4,
+            fill: "none", stroke: C.good, "stroke-width": 2 + 1.5 * Math.abs(Math.sin(ring * Math.PI)),
+            opacity: 0.9 }));
+        }
+        svg.appendChild(S("text", { x: gx, y: gy + rows * cell + 26, class: "svg-label",
+          style: "fill:" + C.good + ";font-size:11px", text: "prefix-cache hit · blocks reused" }));
+      } else {
+        svg.appendChild(S("text", { x: gx, y: gy + rows * cell + 26, class: "svg-label",
+          style: "font-size:11px", text: "16-token paged blocks" }));
+      }
+
+      // ===== 4. TOKEN STREAM: decoded tokens fly out to the right =====
+      const stx = 770;
+      for (let i = 0; i < 4; i++) {
+        const ly = 70 + i * 38;
+        // stream of tokens drifting right and fading
+        for (let k = 0; k < 5; k++) {
+          const prog = ((t * (0.9 + i * 0.1) + k * 0.5) % 2.5) / 2.5;
+          const px = stx + prog * 120;
+          const op = clamp(1 - prog, 0, 1);
+          if (op <= 0.02) continue;
+          svg.appendChild(S("rect", { x: px, y: ly, width: 13, height: 13, rx: 3,
+            fill: C.compute, opacity: 0.85 * op }));
+        }
+        svg.appendChild(S("path", { d: `M${stx-10},${ly+6} l-9,-5 v10 z`, fill: C.compute, opacity: 0.7 }));
+      }
+
+      // connecting arrows between zones
+      svg.appendChild(S("path", { d: `M126,150 H${248}`, stroke: C.accent, "stroke-width": 1.6, opacity: 0.5, fill: "none" }));
+      svg.appendChild(S("path", { d: `M${502},150 H${528}`, stroke: C.kv, "stroke-width": 1.6, opacity: 0.6, fill: "none" }));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl3"), render, autoplay: true, speed: 1 });
+  })();
+
+
+  /* ============================================================= *
+   *  FIGURE 4 — Stepper: static vs dynamic                       *
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg4");
+    const { S, C, clear, lerp, ease, rr } = IOP;
+
+    const W = 920;
+    const splitX = 470;               // boundary between compile-time and runtime
+    const trackY = 120;
+
+    // stages on the timeline
+    const compileStages = [
+      { x: 110, label: "graph capture",   sub: "trace the model" },
+      { x: 250, label: "kernel fusion",   sub: "collapse ops" },
+      { x: 380, label: "quantization",    sub: "lower precision" },
+    ];
+    const runtimeStages = [
+      { x: 560, label: "scheduling",  sub: "queue · batch" },
+      { x: 690, label: "paging",      sub: "KV blocks" },
+      { x: 820, label: "decode loop", sub: "stream tokens" },
+    ];
+
+    // where each engine sits along the static<->dynamic axis (0 left .. 1 right)
+    const engines = [
+      { name: "TensorRT-LLM", pos: 0.16, note: "heavy AOT compile, then run" },
+      { name: "Triton",       pos: 0.55, note: "orchestrates compiled backends" },
+      { name: "vLLM",         pos: 0.74, note: "light startup opt · runtime-heavy" },
+      { name: "SGLang",       pos: 0.82, note: "startup opt + RadixAttention scheduling" },
+    ];
+
+    function backdrop(highlight) {
+      const g = S("g", {});
+      // two regions
+      g.appendChild(S("path", { d: rr(40, 60, splitX - 40 - 8, 320, 12), fill: C.weight,
+        opacity: highlight === "compile" ? 0.14 : 0.06 }));
+      g.appendChild(S("path", { d: rr(splitX + 8, 60, W - 40 - (splitX + 8), 320, 12), fill: C.token,
+        opacity: highlight === "runtime" ? 0.14 : 0.06 }));
+      g.appendChild(S("text", { x: 56, y: 84, class: "svg-title",
+        style: "fill:" + C.weight, text: "compile-time · static" }));
+      g.appendChild(S("text", { x: splitX + 24, y: 84, class: "svg-title",
+        style: "fill:" + C.token, text: "runtime · dynamic" }));
+      g.appendChild(S("text", { x: 56, y: 102, class: "svg-label", text: "one-time, per model + GPU" }));
+      g.appendChild(S("text", { x: splitX + 24, y: 102, class: "svg-label", text: "per request, every step" }));
+      // dashed boundary
+      g.appendChild(S("line", { x1: splitX, y1: 64, x2: splitX, y2: 376,
+        stroke: C.border, "stroke-width": 1.5, "stroke-dasharray": "5 6" }));
+      return g;
+    }
+
+    function stageNode(s, color, lit, p) {
+      const g = S("g", {});
+      const r = lit ? 15 : 11;
+      g.appendChild(S("circle", { cx: s.x, cy: trackY, r: r + (lit ? 6 * (1 - p) : 0),
+        fill: "none", stroke: color, "stroke-width": 1.5, opacity: lit ? 0.5 : 0 }));
+      g.appendChild(S("circle", { cx: s.x, cy: trackY, r, fill: lit ? color : C.card,
+        stroke: color, "stroke-width": 2, opacity: lit ? 1 : 0.7 }));
+      g.appendChild(S("text", { x: s.x, y: trackY - 26, "text-anchor": "middle", class: "svg-title",
+        style: "font-size:12.5px" + (lit ? "" : ";fill:" + C.muted), text: s.label }));
+      g.appendChild(S("text", { x: s.x, y: trackY + 30, "text-anchor": "middle", class: "svg-label",
+        style: "font-size:10.5px", text: s.sub }));
+      return g;
+    }
+
+    function render(step, p) {
+      clear(svg);
+      const hl = step === 0 ? "compile" : step === 1 ? "runtime" : "both";
+      svg.appendChild(backdrop(hl));
+
+      // the timeline track
+      svg.appendChild(S("line", { x1: 70, y1: trackY, x2: W - 50, y2: trackY,
+        stroke: C.border, "stroke-width": 2 }));
+
+      const showCompile = step >= 0;
+      const showRuntime = step >= 1;
+
+      compileStages.forEach((s, i) => {
+        const lit = step === 0 || step >= 2;
+        svg.appendChild(stageNode(s, C.compute, lit, step === 0 ? p : 1));
+      });
+      runtimeStages.forEach((s, i) => {
+        const lit = step === 1 || step >= 2;
+        const sNode = stageNode(s, i === 1 ? C.kv : C.token, lit, step === 1 ? p : 1);
+        svg.appendChild(sNode);
+      });
+
+      // moving "model" token: in step 0 it walks the compile lane;
+      // in step 1 it walks the runtime lane; in step 2 it walks the whole line.
+      let mx;
+      if (step === 0) mx = lerp(compileStages[0].x, compileStages[2].x, ease(p));
+      else if (step === 1) mx = lerp(runtimeStages[0].x, runtimeStages[2].x, ease(p));
+      else mx = lerp(compileStages[0].x, runtimeStages[2].x, ease(p));
+      if (step <= 2) {
+        svg.appendChild(S("path", { d: rr(mx - 26, trackY - 58, 52, 20, 10), fill: C.accent }));
+        svg.appendChild(S("text", { x: mx, y: trackY - 44, "text-anchor": "middle",
+          style: "font-family:var(--mono);font-size:10px;font-weight:700;fill:#06121f", text: "model" }));
+        svg.appendChild(S("line", { x1: mx, y1: trackY - 38, x2: mx, y2: trackY - 17,
+          stroke: C.accent, "stroke-width": 1.5, "stroke-dasharray": "2 3" }));
+      }
+
+      // engine placements (only revealed on step 3)
+      if (step >= 3) {
+        engines.forEach((e, i) => {
+          const ex = lerp(70, W - 50, e.pos);
+          const ey = 250 + i * 30;
+          // tick down to the axis position
+          svg.appendChild(S("line", { x1: ex, y1: trackY + 16, x2: ex, y2: ey,
+            stroke: C.weight, "stroke-width": 1, opacity: 0.4, "stroke-dasharray": "3 4" }));
+          svg.appendChild(S("circle", { cx: ex, cy: trackY + 16, r: 4, fill: C.weight }));
+          svg.appendChild(S("path", { d: rr(ex - 4, ey - 12, 4, 0, 0), fill: "none" }));
+          // label chip
+          const chipW = 150;
+          let cxp = ex - 8;
+          if (cxp + chipW > W - 40) cxp = W - 40 - chipW;
+          if (cxp < 44) cxp = 44;
+          svg.appendChild(S("path", { d: rr(cxp, ey - 13, chipW, 24, 7), fill: C.card, stroke: C.weight, "stroke-width": 1.2,
+            opacity: i < (p * 4 + 0.5) ? 1 : 0.15 }));
+          svg.appendChild(S("circle", { cx: cxp + 13, cy: ey - 1, r: 5, fill: C.weight,
+            opacity: i < (p * 4 + 0.5) ? 1 : 0.15 }));
+          svg.appendChild(S("text", { x: cxp + 24, y: ey + 3, class: "svg-label",
+            style: "font-size:11px;fill:" + C.text + (i < (p * 4 + 0.5) ? "" : ";opacity:0.2"),
+            text: e.name }));
+        });
+        svg.appendChild(S("text", { x: 460, y: 376, "text-anchor": "middle", class: "svg-label",
+          style: "font-size:10.5px", text: "← more is decided ahead of time      decided live, per request →" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl4"),
+      caption:  document.getElementById("cap4"),
+      captions: [
+        "<b>Compile-time (static).</b> TensorRT runs a one-time <span class='k'>compilation</span> per model and GPU: it captures the execution <span class='k'>graph</span>, fuses ops into single kernels, and quantizes weights. Slow once, fast forever after.",
+        "<b>Runtime (dynamic).</b> No matter the engine, the live path is <span class='k'>per request</span>: schedule into a batch, page the KV cache, and run the decode loop. This is where vLLM and SGLang spend most of their cleverness.",
+        "<b>The full path.</b> A deployed model crosses both regions — built once on the left, then executed millions of times on the right. The art is choosing what to fix early vs. decide live.",
+        "<b>Engines on the axis.</b> <span class='k'>TensorRT-LLM</span> leans hard left (ahead-of-time compiled). <span class='k'>vLLM</span> and <span class='k'>SGLang</span> do only light startup optimization and lean right, runtime-heavy. <span class='k'>Triton</span> sits in the middle — it orchestrates compiled backends. Same goal, different static/dynamic split.",
+      ],
+      render,
+      dwell: 2100,
+      autoplay: false,
+    });
+  })();
+  </script>
+</body>
+</html>

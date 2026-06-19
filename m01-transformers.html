@@ -1,0 +1,842 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE 1 — LLMs and Transformers
+     Interactive companion for IOP Systems · Inference Infrastructure.
+     Uses shared.css + shared.js only. Vanilla JS + inline SVG. Offline.
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLMs and Transformers — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;1 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/transformers/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 1 · Foundations</div>
+      <h1>LLMs and Transformers</h1>
+      <p class="lead">A large language model reads a prompt and generates the next token, over and over,
+      until it decides to stop. This page animates what happens inside: how tokens become vectors, how
+      <em>attention</em> lets words shape each other's meaning, and how modern variants trade memory for
+      quality. Start here; the mechanisms below recur in every later module.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Autoregressive loop (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>The autoregressive generation loop</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">An LLM generates text one token at a time. Each new token is appended to the input
+      and fed back in — a loop that runs until an end-of-sequence token appears.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 420" role="img" aria-label="Autoregressive generation loop: tokens become embeddings, pass through the Transformer stack, produce a probability distribution, a token is sampled and appended, and the loop repeats."></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token / text</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> weights (Transformer)</span>
+        <span class="item"><span class="sw" style="background:var(--attn)"></span> probability distribution</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The first step of that loop — turning words into vectors — is the <strong>embedding matrix</strong>.
+      Models actually work on <strong>tokens</strong> (usually sub-word pieces), not whole words. Embedding
+      is a fixed lookup that maps each token to a point in a <code>d_model</code>-dimensional space, where
+      similar meanings sit close together. But a raw embedding is context-free: the <code>bear</code> in
+      <em>"a brown bear"</em> starts identical to the <code>bear</code> in <em>"doesn't bear fruit"</em>.
+      <strong>Attention</strong> is what pulls them apart.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Self-attention in one head (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Self-attention in one head</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Watch a single attention head disambiguate <em>"bear"</em> by letting it attend to
+      <em>"brown"</em>. Project the tokens into Q, K, V, score every pair, mask the future, softmax, and
+      mix the values back in.</p>
+
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 400" role="img" aria-label="Self-attention: the context matrix is projected by learned weight matrices into Query, Key and Value; scores are Q times K-transpose over the square root of d_k; the causal mask zeroes the upper triangle; softmax turns each row into attention weights; multiplying by V updates each token's representation."></svg>
+      </div>
+
+      <div id="ctrl2"></div>
+      <div id="cap2" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token vectors (context)</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> learned weights W&#x1D40;</span>
+        <span class="item"><span class="sw" style="background:var(--attn)"></span> attention scores</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> causal mask</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>That square <code>k × k</code> grid is the heart of attention: cell <code>A[i,j]</code> is how much
+      token <code>i</code> attends to token <code>j</code>. It is not symmetric, and during generation the
+      upper triangle is <strong>masked</strong> so a token can never peek at words that come after it.
+      One head can only surface the single most prominent relationship, though — so Transformers run many
+      heads at once.</p>
+    </div>
+
+    <!-- ================= FIGURE 3 — Multi-head attention (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Multi-head attention: many views in parallel</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">A layer splits its work across <code>h</code> heads. Each has its own
+      W&#x1D9C;/W&#x1D37;/W&#x1D5B; and learns a different relationship; the outputs are concatenated and
+      mixed by a shared W&#x1D3C;.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 360" role="img" aria-label="Multi-head attention: the same input feeds several heads in parallel, each computing its own attention pattern; their outputs are concatenated and projected by a shared output matrix W-O into the updated hidden state."></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> shared input</span>
+        <span class="item"><span class="sw" style="background:var(--attn)"></span> per-head attention</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> W&#x1D3C; output projection</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> updated hidden state</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Why this matters for inference</span>
+      Every head keeps its own <strong>K</strong> and <strong>V</strong> vectors, and during generation
+      those are cached and reused for every future token (the <em>KV cache</em>, Module&nbsp;2). With many
+      heads that cache gets large fast — which is exactly the pressure the next figure's variants relieve.
+    </div>
+
+    <!-- ================= FIGURE 4 — KV footprint of attention variants (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Shrinking the KV footprint: MHA → MQA → GQA → MLA</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">All four compute attention — but they differ in how many distinct K/V projections
+      they keep, which sets how much memory the KV cache consumes. Step through the trade-off.</p>
+
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 400" role="img" aria-label="KV cache footprint of four attention variants: MHA gives every head its own K and V; MQA shares one K and V across all heads; GQA shares K and V within groups of heads; MLA stores a small compressed latent per token and decompresses per head. A bar chart shows their relative memory."></svg>
+      </div>
+
+      <div id="ctrl4"></div>
+      <div id="cap4" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> query heads</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> stored K / V</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> KV memory</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> compressed latent</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The lever is simple: fewer distinct <code>K/V</code> projections means a smaller KV cache, usually at
+      some cost to quality. <strong>MQA</strong> shares one K/V across all heads (memory ÷ <code>h</code>);
+      <strong>GQA</strong> shares within <code>g</code> groups (memory ÷ <code>h/g</code>) and is the popular
+      sweet spot — an MHA model can be converted with <em>mean pooling</em> and only ~5% of the original
+      compute to <em>uptrain</em>. <strong>MLA</strong> instead stores one small <em>compressed latent</em>
+      per token and lets each head decompress its own K/V, reaching GQA-like memory with MHA-like quality.</p>
+    </div>
+
+    <!-- ================= FIGURE 5 — Mixture-of-Experts (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Mixture-of-Experts: route each token to a few experts</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Attention is unchanged. The one dense feed-forward network is replaced by many small
+      <em>expert</em> FFNs plus a <em>router</em> that sends each token to only its top-k experts.</p>
+
+      <div class="stage">
+        <svg id="svg5" viewBox="0 0 920 380" role="img" aria-label="Mixture-of-Experts: tokens leave the unchanged attention block and reach a router, which selects the top-k experts for each token; only those experts activate; their outputs are combined by a weighted sum. A load-balance meter tracks how evenly tokens are spread across experts."></svg>
+      </div>
+
+      <div id="ctrl5"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> router</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> active expert</span>
+        <span class="item"><span class="sw" style="background:var(--faint)"></span> idle expert</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Because each token visits only <code>k</code> of the experts, an MoE layer holds the same total
+      parameters as a dense one but <strong>activates only a fraction per token</strong> — more capacity for
+      the same compute. The catch is the router: if it funnels everything to one expert, the others starve and
+      quality collapses. Training adds noise to routing scores and minimizes an <strong>auxiliary
+      (load-balancing) loss</strong> so tokens spread evenly across experts.</p>
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="index.html"><span class="dir">← Previous</span><span class="ttl">All modules / Hub</span></a>
+      <a class="next" href="m02-kvcache.html"><span class="dir">Next →</span><span class="ttl">Inference and the KV Cache</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  "use strict";
+  const { S, C, clear, lerp, ease, easeOut, rr, map, clamp } = IOP;
+
+  // shared little helpers --------------------------------------------------
+  function box(x, y, w, h, fill, opts) {
+    opts = opts || {};
+    return S("path", Object.assign({
+      d: rr(x, y, w, h, opts.r == null ? 8 : opts.r),
+      fill: fill, opacity: opts.opacity == null ? 1 : opts.opacity,
+      stroke: opts.stroke || "none",
+      "stroke-width": opts.sw || 1,
+    }, opts.extra || {}));
+  }
+  function txt(x, y, s, cls, extra) {
+    return S("text", Object.assign({ x: x, y: y, text: s, class: cls || "svg-label" }, extra || {}));
+  }
+  function arrow(svg, x1, y1, x2, y2, color, p) {
+    p = p == null ? 1 : p;
+    const xm = lerp(x1, x2, p), ym = lerp(y1, y2, p);
+    svg.appendChild(S("line", { x1, y1, x2: xm, y2: ym, stroke: color, "stroke-width": 2.2, opacity: .8 }));
+    if (p > .85) {
+      const a = Math.atan2(y2 - y1, x2 - x1);
+      const ah = 7;
+      svg.appendChild(S("path", {
+        d: `M${x2},${y2} L${x2 - ah*Math.cos(a - .5)},${y2 - ah*Math.sin(a - .5)} L${x2 - ah*Math.cos(a + .5)},${y2 - ah*Math.sin(a + .5)} Z`,
+        fill: color, opacity: .9,
+      }));
+    }
+  }
+
+  // ===================== FIGURE 1 — Autoregressive Loop =====================
+  (function () {
+    const svg = document.getElementById("svg1");
+    const SENT = ["The", "brown", "bear"];                 // seed prompt
+    const NEXT = ["climbed", "the", "tall", "tree", "•EOS"]; // tokens it will generate
+    const VOCAB = ["climbed", "ran", "the", "ate", "slept"]; // distribution shown at the sampling step
+
+    function render(t) {
+      clear(svg);
+      // pace: one full cycle every ~3.4s
+      const CYCLE = 3.4;
+      const gen = Math.floor(t / CYCLE) % (NEXT.length + 1); // how many tokens generated so far (loops)
+      const ph = (t % CYCLE) / CYCLE;                        // 0..1 within current cycle
+
+      const built = SENT.concat(NEXT.slice(0, gen));
+      const isEOS = gen > 0 && NEXT[gen - 1] === "•EOS";
+
+      // ---- title row ----
+      svg.appendChild(txt(28, 30, "GENERATING ONE TOKEN AT A TIME", "svg-label", { "letter-spacing": "1.5", fill: C.faint }));
+
+      // ---- stage A: current sequence (top) ----
+      let x = 30; const y = 56, h = 34;
+      svg.appendChild(txt(30, y - 8, "sequence so far", "svg-label", { fill: C.muted }));
+      built.forEach((w, i) => {
+        const wd = 24 + w.length * 9;
+        const isNew = i === built.length - 1 && gen > 0;
+        const col = w === "•EOS" ? C.warn : C.token;
+        const op = isNew ? lerp(.35, 1, easeOut(clamp(ph * 1.4, 0, 1))) : .92;
+        svg.appendChild(box(x, y, wd, h, col, { opacity: op, r: 7 }));
+        svg.appendChild(txt(x + wd / 2, y + 22, w, "svg-title", { "text-anchor": "middle", fill: "#06121f", "font-size": "13.5" }));
+        x += wd + 8;
+      });
+
+      // ---- the pipeline boxes (middle) ----
+      const cy = 168;
+      const stages = [
+        { x: 40,  w: 150, label: "Embedding matrix", sub: "token → vector", col: C.token },
+        { x: 230, w: 200, label: "Transformer stack", sub: "attention + FFN ×N", col: C.weight },
+        { x: 470, w: 200, label: "Probability dist.", sub: "scores over vocab", col: C.attn },
+        { x: 710, w: 170, label: "Sample next", sub: "argmax + temperature", col: C.compute },
+      ];
+      // which stage is "hot" right now (sweep across the 4 boxes during first 70% of cycle)
+      const sweep = clamp(ph / 0.72, 0, 1) * stages.length;
+      stages.forEach((s, i) => {
+        const hot = sweep > i && sweep < i + 1.25 && !isEOS;
+        svg.appendChild(box(s.x, cy, s.w, 64, C.card, { stroke: hot ? s.col : C.border, sw: hot ? 2.4 : 1, r: 11 }));
+        if (hot) svg.appendChild(box(s.x, cy, s.w, 64, s.col, { opacity: .14, r: 11 }));
+        svg.appendChild(txt(s.x + s.w / 2, cy + 27, s.label, "svg-title", { "text-anchor": "middle", "font-size": "13.5", fill: hot ? "#fff" : C.text }));
+        svg.appendChild(txt(s.x + s.w / 2, cy + 46, s.sub, "svg-label", { "text-anchor": "middle", "font-size": "11", fill: C.muted }));
+      });
+      // connectors between pipeline boxes
+      for (let i = 0; i < stages.length - 1; i++) {
+        const a = stages[i], b = stages[i + 1];
+        const pp = clamp((sweep - i) * 1.3, 0, 1);
+        arrow(svg, a.x + a.w, cy + 32, b.x, cy + 32, C.faint, isEOS ? 1 : pp);
+      }
+      // feed from sequence down into embedding
+      arrow(svg, 115, y + h, 115, cy, C.token, clamp(ph / .15, 0, 1));
+
+      // ---- mini probability distribution under the "Probability dist." box ----
+      if (sweep > 2 && !isEOS) {
+        const baseX = 470, baseY = 250, bw = 30, gap = 8;
+        const probs = [0.55, 0.12, 0.22, 0.06, 0.05];
+        const reveal = clamp((sweep - 2.0) / 1.0, 0, 1);
+        VOCAB.forEach((v, i) => {
+          const bh = probs[i] * 90 * reveal;
+          const bx = baseX + i * (bw + gap);
+          const top = i === 0;
+          svg.appendChild(box(bx, baseY - bh, bw, bh, top ? C.compute : C.attn, { opacity: top ? .95 : .55, r: 3 }));
+          svg.appendChild(txt(bx + bw / 2, baseY + 14, v, "svg-label", { "text-anchor": "middle", "font-size": "9.5", fill: top ? C.good : C.muted }));
+        });
+        svg.appendChild(txt(baseX, baseY - 104, "softmax over vocabulary", "svg-label", { "font-size": "10.5", fill: C.muted }));
+      }
+
+      // ---- the LOOP arrow: sample → append → back to sequence (make it obvious) ----
+      const loopActive = ph > 0.7 && !isEOS;
+      const lp = clamp((ph - 0.7) / 0.28, 0, 1);
+      // path from "Sample next" box up-and-left back to the sequence
+      const path = `M795,${cy} C795,108 795,96 ${x + 20},96 L${x + 20},${y + h + 2}`;
+      svg.appendChild(S("path", { d: path, fill: "none", stroke: C.accent2, "stroke-width": loopActive ? 3 : 1.6,
+        "stroke-dasharray": "7 6", opacity: loopActive ? .95 : .3,
+        "stroke-dashoffset": loopActive ? (-t * 60 % 26) : 0 }));
+      svg.appendChild(txt(560, 92, "append token, feed back — repeat until EOS", "svg-label",
+        { "text-anchor": "middle", "font-size": "11.5", fill: loopActive ? C.accent2 : C.faint }));
+      // moving dot riding the loop when active
+      if (loopActive) {
+        const dx = lerp(795, x + 20, easeOut(lp));
+        const dy = lp < .5 ? lerp(cy, 96, easeOut(lp * 2)) : 96;
+        svg.appendChild(S("circle", { cx: dx, cy: dy, r: 6, fill: C.accent2 }));
+      }
+
+      // ---- EOS banner ----
+      if (isEOS) {
+        svg.appendChild(box(330, 300, 260, 44, C.warn, { opacity: .16, r: 10, stroke: C.warn, sw: 1.4 }));
+        svg.appendChild(txt(460, 327, "EOS reached → generation stops", "svg-title",
+          { "text-anchor": "middle", "font-size": "14", fill: C.warn }));
+      }
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl1"), render, autoplay: true, speed: 1 });
+  })();
+
+  // ===================== FIGURE 2 — Self-attention (Stepper) =====================
+  (function () {
+    const svg = document.getElementById("svg2");
+    const TOKENS = ["The", "brown", "bear"];
+    const k = TOKENS.length;
+    // illustrative pre-softmax scores ("bear" attends strongly to "brown"); raw, unmasked
+    const RAW = [
+      [3.0, 0.2, 0.1],
+      [0.4, 3.2, 0.3],
+      [0.6, 2.6, 1.2],   // bear → brown is high
+    ];
+    function softmaxRowMasked(row, i) {
+      // causal: token i can only see j <= i
+      const vals = row.map((v, j) => (j <= i ? v : -Infinity));
+      const m = Math.max.apply(null, vals.filter(isFinite));
+      const ex = vals.map(v => (isFinite(v) ? Math.exp(v - m) : 0));
+      const s = ex.reduce((a, b) => a + b, 0);
+      return ex.map(e => e / s);
+    }
+    const ATTN = RAW.map((r, i) => softmaxRowMasked(r, i));
+
+    // layout anchors
+    const ctxX = 40, ctxY = 90, cellW = 18, cellH = 30, ctxCols = 5; // context matrix k×d (illustrative d=5)
+
+    function drawTokenLabels(x, y) {
+      TOKENS.forEach((tname, i) => {
+        svg.appendChild(txt(x - 8, y + i * (cellH + 8) + cellH / 2 + 4, tname, "svg-label",
+          { "text-anchor": "end", "font-size": "11.5", fill: C.muted }));
+      });
+    }
+    function matrix(x, y, rows, cols, fill, p, opts) {
+      opts = opts || {};
+      const g = S("g", {});
+      svg.appendChild(g);
+      for (let i = 0; i < rows; i++) {
+        for (let j = 0; j < cols; j++) {
+          const rp = clamp(p * rows - i, 0, 1);
+          g.appendChild(box(x + j * (cellW + 2), y + i * (cellH + 8), cellW, cellH, fill,
+            { opacity: .25 + .6 * rp * (opts.op || 1), r: 3 }));
+        }
+      }
+      return g;
+    }
+    function heat(x, y, p, masked, withSoftmax) {
+      const cs = 40, gap = 6;
+      // column headers
+      TOKENS.forEach((tn, j) => svg.appendChild(txt(x + j * (cs + gap) + cs / 2, y - 8, tn, "svg-label",
+        { "text-anchor": "middle", "font-size": "10", fill: C.faint })));
+      for (let i = 0; i < k; i++) {
+        svg.appendChild(txt(x - 8, y + i * (cs + gap) + cs / 2 + 4, TOKENS[i], "svg-label",
+          { "text-anchor": "end", "font-size": "10", fill: C.faint }));
+        for (let j = 0; j < k; j++) {
+          const cx = x + j * (cs + gap), cy = y + i * (cs + gap);
+          const isFuture = j > i;
+          if (masked && isFuture) {
+            svg.appendChild(box(cx, cy, cs, cs, C.warn, { opacity: .14, r: 5, stroke: C.warn, sw: 1 }));
+            svg.appendChild(txt(cx + cs / 2, cy + cs / 2 + 4, "×", "svg-label",
+              { "text-anchor": "middle", "font-size": "16", fill: C.warn }));
+          } else {
+            const v = withSoftmax ? ATTN[i][j] : clamp(RAW[i][j] / 3.4, 0, 1);
+            const shown = (masked && isFuture) ? 0 : v;
+            const op = 0.12 + 0.85 * shown * p;
+            svg.appendChild(box(cx, cy, cs, cs, C.attn, { opacity: op, r: 5 }));
+            if (withSoftmax && p > .6)
+              svg.appendChild(txt(cx + cs / 2, cy + cs / 2 + 4, shown.toFixed(2), "svg-label",
+                { "text-anchor": "middle", "font-size": "10", fill: shown > .5 ? "#fff" : C.muted }));
+          }
+        }
+      }
+    }
+
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(txt(28, 28, "ONE ATTENTION HEAD ON “The brown bear”", "svg-label",
+        { "letter-spacing": "1.2", fill: C.faint }));
+
+      // STEP 0 — context matrix
+      if (step === 0) {
+        drawTokenLabels(ctxX, ctxY);
+        matrix(ctxX, ctxY, k, ctxCols, C.token, p);
+        svg.appendChild(txt(ctxX, ctxY - 16, "context matrix  (k × d_model)", "svg-label", { fill: C.muted }));
+        svg.appendChild(txt(ctxX, ctxY + 3 * (cellH + 8) + 22, "each row = one token's embedding", "svg-label",
+          { "font-size": "11", fill: C.faint }));
+        svg.appendChild(txt(560, 200, "Raw embeddings carry no relationships yet —", "svg-title",
+          { "font-size": "14", fill: C.text }));
+        svg.appendChild(txt(560, 224, "“bear” looks the same as in any sentence.", "svg-label",
+          { "font-size": "12.5", fill: C.muted }));
+      }
+
+      // STEP 1 — project into Q, K, V
+      if (step === 1) {
+        drawTokenLabels(ctxX, ctxY);
+        matrix(ctxX, ctxY, k, ctxCols, C.token, 1, { op: .6 });
+        svg.appendChild(txt(ctxX, ctxY - 16, "context (k × d_model)", "svg-label", { fill: C.muted }));
+        const labels = [["W^Q → Q", 360], ["W^K → K", 560], ["W^V → V", 760]];
+        labels.forEach(([lab, x], idx) => {
+          // weight chip
+          arrow(svg, ctxX + 5 * (cellW + 2) + 6, ctxY + 55, x - 12, ctxY + 55, C.weight, clamp(p * 1.3 - idx * .12, 0, 1));
+          svg.appendChild(box(x - 64, 60, 56, 24, C.weight, { opacity: .85 * p, r: 6 }));
+          svg.appendChild(txt(x - 36, 76, lab.split(" ")[0], "svg-label",
+            { "text-anchor": "middle", "font-size": "11", fill: "#06121f" }));
+          // resulting matrix (k × d_k)
+          matrix(x - 20, ctxY, k, 3, idx === 2 ? C.kv : (idx === 1 ? C.kv : C.compute), clamp(p * 1.3 - idx * .12, 0, 1));
+          svg.appendChild(txt(x - 20, ctxY + 3 * (cellH + 8) + 20, lab.split("→ ")[1] + "  (k × d_k)", "svg-label",
+            { "font-size": "11", fill: C.muted }));
+        });
+        svg.appendChild(txt(28, 360, "Three learned weight matrices project the same tokens three different ways.",
+          "svg-label", { "font-size": "12", fill: C.faint }));
+      }
+
+      // STEP 2 — scores = Q·Kᵀ / √d_k
+      if (step === 2) {
+        svg.appendChild(txt(40, 70, "scores  =  Q · Kᵀ  /  √d_k", "svg-title", { "font-size": "16", fill: C.text }));
+        heat(150, 110, p, false, false);
+        svg.appendChild(txt(150, 100, "raw score grid  (k × k)", "svg-label", { fill: C.muted }));
+        svg.appendChild(txt(560, 150, "Each cell = dot product of a Query", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 170, "with a Key. Scaled by √d_k so the", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 190, "numbers don't blow up before softmax.", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 226, "Brighter = stronger match.", "svg-label", { "font-size": "12.5", fill: C.attn }));
+      }
+
+      // STEP 3 — causal mask
+      if (step === 3) {
+        svg.appendChild(txt(40, 70, "apply the causal mask", "svg-title", { "font-size": "16", fill: C.text }));
+        heat(150, 110, 1, true, false);
+        svg.appendChild(txt(560, 150, "A token may only attend to itself", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 170, "and earlier tokens.", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 198, "The upper triangle (the future) is", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 218, "masked out so generation can't cheat.", "svg-label", { "font-size": "12.5", fill: C.warn }));
+      }
+
+      // STEP 4 — softmax → attention scores
+      if (step === 4) {
+        svg.appendChild(txt(40, 70, "softmax each row → attention scores", "svg-title", { "font-size": "16", fill: C.text }));
+        heat(150, 110, p, true, true);
+        svg.appendChild(txt(560, 150, "Each row now sums to 1: a probability", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 170, "distribution over which tokens to mix in.", "svg-label", { "font-size": "12.5", fill: C.muted }));
+        svg.appendChild(txt(560, 204, "Row “bear” leans hard on “brown”", "svg-label", { "font-size": "12.5", fill: C.attn }));
+        svg.appendChild(txt(560, 224, "(0.78) — disambiguation in action.", "svg-label", { "font-size": "12.5", fill: C.attn }));
+      }
+
+      // STEP 5 — ·V → updated representations
+      if (step === 5) {
+        // small attention grid on the left
+        const x0 = 60, y0 = 110, cs = 30, gp = 4;
+        svg.appendChild(txt(x0, y0 - 12, "attention (k×k)", "svg-label", { "font-size": "10.5", fill: C.muted }));
+        for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) {
+          const future = j > i;
+          svg.appendChild(box(x0 + j * (cs + gp), y0 + i * (cs + gp), cs, cs, future ? C.warn : C.attn,
+            { opacity: future ? .1 : (.15 + .8 * ATTN[i][j]), r: 4 }));
+        }
+        // × V
+        svg.appendChild(txt(x0 + 3 * (cs + gp) + 12, y0 + 50, "×", "svg-title", { "font-size": "20", fill: C.muted }));
+        matrix(x0 + 3 * (cs + gp) + 30, y0, k, 3, C.kv, 1);
+        svg.appendChild(txt(x0 + 3 * (cs + gp) + 30, y0 - 12, "V", "svg-label", { "font-size": "10.5", fill: C.kv }));
+        // =
+        const eqX = x0 + 3 * (cs + gp) + 30 + 3 * (cellW + 2) + 14;
+        svg.appendChild(txt(eqX, y0 + 50, "=", "svg-title", { "font-size": "20", fill: C.muted }));
+        // updated tokens
+        const outX = eqX + 22;
+        TOKENS.forEach((tn, i) => {
+          const settle = clamp(p * k - i, 0, 1);
+          svg.appendChild(box(outX, y0 + i * (cellH + 8), 150, cellH, C.compute, { opacity: .3 + .55 * settle, r: 6 }));
+          svg.appendChild(txt(outX + 10, y0 + i * (cellH + 8) + 20, tn, "svg-label",
+            { "font-size": "12", fill: "#06121f" }));
+          if (i === 2)
+            svg.appendChild(txt(outX + 158, y0 + i * (cellH + 8) + 20,
+              "← now means the animal", "svg-label", { "font-size": "11.5", fill: C.good, opacity: settle }));
+        });
+        svg.appendChild(txt(60, 360, "Each token's new vector is a weighted blend of the Values it attended to.",
+          "svg-label", { "font-size": "12", fill: C.faint }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl2"),
+      caption: document.getElementById("cap2"),
+      captions: [
+        "<b>Step 1 — Context matrix.</b> The layer receives a <span class='k'>k × d_model</span> matrix: one row per token, each row that token's current embedding. At this point “bear” carries no clue about “brown”.",
+        "<b>Step 2 — Project to Q, K, V.</b> The same tokens are multiplied by three learned weight matrices — <span class='k'>W^Q, W^K, W^V</span> — producing a <span class='k'>Query</span>, <span class='k'>Key</span> and <span class='k'>Value</span> for every token. Each weight encodes different knowledge.",
+        "<b>Step 3 — Score every pair.</b> <span class='k'>scores = Q · Kᵀ / √d_k</span>. The dot product of token i's Query with token j's Key measures how relevant j is to i; dividing by √d_k keeps the numbers stable.",
+        "<b>Step 4 — Causal mask.</b> During generation a token must not see the future, so the upper triangle (j &gt; i) is <span class='k'>masked</span> to −∞. Attention is not symmetric.",
+        "<b>Step 5 — Softmax → attention scores.</b> Softmax turns each row into a probability distribution. Row “bear” puts <span class='k'>0.78</span> of its weight on “brown” — exactly the disambiguating link.",
+        "<b>Step 6 — Multiply by V.</b> The attention scores times the <span class='k'>Value</span> matrix produce each token's updated representation — a weighted blend of what it attended to. “bear” now leans toward the animal sense.",
+      ],
+      render,
+      dwell: 2100,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 3 — Multi-head attention (Loop) =====================
+  (function () {
+    const svg = document.getElementById("svg3");
+    const HEADS = [
+      { name: "Head 1", rel: "cardinality", seed: 11 },
+      { name: "Head 2", rel: "temporal",    seed: 29 },
+      { name: "Head 3", rel: "syntax",      seed: 47 },
+      { name: "Head 4", rel: "coreference", seed: 5  },
+    ];
+    const n = HEADS.length, k = 3;
+    function rng(s) { return function () { s = (s * 9301 + 49297) % 233280; return s / 233280; }; }
+
+    function render(t) {
+      clear(svg);
+      svg.appendChild(txt(28, 28, "h HEADS COMPUTE IN PARALLEL, THEN MERGE", "svg-label",
+        { "letter-spacing": "1.2", fill: C.faint }));
+
+      // shared input on the left
+      const inX = 40, inY = 120;
+      svg.appendChild(box(inX, inY, 80, 110, C.token, { opacity: .85, r: 9 }));
+      svg.appendChild(txt(inX + 40, inY + 52, "same", "svg-title", { "text-anchor": "middle", "font-size": "12.5", fill: "#06121f" }));
+      svg.appendChild(txt(inX + 40, inY + 70, "input", "svg-title", { "text-anchor": "middle", "font-size": "12.5", fill: "#06121f" }));
+      svg.appendChild(txt(inX + 40, inY - 10, "hidden state", "svg-label", { "text-anchor": "middle", "font-size": "11", fill: C.muted }));
+
+      const headX = 230, headY0 = 60, headGap = 70, hw = 200, hh = 56;
+      const merged = (Math.sin(t * 0.9) * 0.5 + 0.5); // pulse for merge highlight
+
+      HEADS.forEach((hd, idx) => {
+        const y = headY0 + idx * headGap;
+        // wire from input
+        arrow(svg, inX + 80, inY + 55, headX, y + hh / 2, C.token, 1);
+        // head card
+        svg.appendChild(box(headX, y, hw, hh, C.card, { stroke: C.border, r: 9 }));
+        svg.appendChild(txt(headX + 12, y + 22, hd.name, "svg-title", { "font-size": "12.5", fill: C.text }));
+        svg.appendChild(txt(headX + 12, y + 40, "own W^Q/W^K/W^V", "svg-label", { "font-size": "10", fill: C.weight }));
+        // mini attention pattern unique to this head (animated shimmer)
+        const r = rng(hd.seed);
+        const base = []; for (let i = 0; i < k * k; i++) base.push(r());
+        const gx = headX + 120, gy = y + 10, cs = 11, gp = 2;
+        for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) {
+          const future = j > i;
+          const idx2 = i * k + j;
+          const v = future ? 0 : (0.2 + 0.8 * Math.abs(Math.sin(base[idx2] * 6 + t * 1.2 + idx)));
+          svg.appendChild(box(gx + j * (cs + gp), gy + i * (cs + gp), cs, cs, future ? C.faint : C.attn,
+            { opacity: future ? .12 : v, r: 2 }));
+        }
+        svg.appendChild(txt(gx + 1.5 * (cs + gp), gy + 3 * (cs + gp) + 11, hd.rel, "svg-label",
+          { "text-anchor": "middle", "font-size": "9", fill: C.attn }));
+        // wire to concat
+        arrow(svg, headX + hw, y + hh / 2, 560, 165, C.attn, 1);
+      });
+
+      // concat strip
+      const cX = 560, cY = 95, cW = 26, cH = 150;
+      svg.appendChild(txt(cX + 30, cY - 12, "concat", "svg-label", { "text-anchor": "middle", "font-size": "11", fill: C.muted }));
+      for (let i = 0; i < n; i++) {
+        svg.appendChild(box(cX, cY + i * (cH / n), cW + 8, cH / n - 4, C.attn, { opacity: .35 + .15 * i, r: 3 }));
+      }
+
+      // W^O projection
+      const oX = 640, oY = 120;
+      arrow(svg, cX + cW + 12, cY + cH / 2, oX, oY + 55, C.faint, 1);
+      svg.appendChild(box(oX, oY, 86, 110, C.weight, { opacity: .9, r: 10, stroke: merged > .6 ? "#fff" : "none", sw: 1.5 }));
+      svg.appendChild(txt(oX + 43, oY + 52, "W^O", "svg-title", { "text-anchor": "middle", "font-size": "16", fill: "#06121f" }));
+      svg.appendChild(txt(oX + 43, oY + 72, "mix heads", "svg-label", { "text-anchor": "middle", "font-size": "9.5", fill: "#06121f" }));
+      svg.appendChild(txt(oX + 43, oY - 10, "shared", "svg-label", { "text-anchor": "middle", "font-size": "10.5", fill: C.weight }));
+
+      // updated hidden state out
+      const uX = 790, uY = 120;
+      arrow(svg, oX + 86, oY + 55, uX, uY + 55, C.compute, clamp(merged + .3, 0, 1));
+      svg.appendChild(box(uX, uY, 96, 110, C.compute, { opacity: .85, r: 9 }));
+      svg.appendChild(txt(uX + 48, uY + 48, "updated", "svg-title", { "text-anchor": "middle", "font-size": "12.5", fill: "#06121f" }));
+      svg.appendChild(txt(uX + 48, uY + 66, "hidden state", "svg-title", { "text-anchor": "middle", "font-size": "11.5", fill: "#06121f" }));
+      svg.appendChild(txt(uX + 48, uY - 10, "→ to FFN", "svg-label", { "text-anchor": "middle", "font-size": "10.5", fill: C.muted }));
+
+      svg.appendChild(txt(460, 340, "Different heads learn different relationships; W^O blends them into one coherent representation.",
+        "svg-label", { "text-anchor": "middle", "font-size": "12", fill: C.faint }));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl3"), render, autoplay: true, speed: 1 });
+  })();
+
+  // ===================== FIGURE 4 — KV variants (Stepper) =====================
+  (function () {
+    const svg = document.getElementById("svg4");
+    const H = 8; // heads
+    // memory factor (relative to MHA = 1.0), illustrative
+    const VARIANTS = {
+      MHA: { mem: 1.00, kvGroups: 8, label: "Multi-Head Attention" },
+      MQA: { mem: 1 / 8, kvGroups: 1, label: "Multi-Query Attention" },
+      GQA: { mem: 2 / 8, kvGroups: 2, label: "Grouped-Query Attention (g=2)" },
+      MLA: { mem: 0.28,  kvGroups: -1, label: "Multi-head Latent Attention" },
+    };
+
+    // draw h query heads in a row, plus the K/V boxes feeding them
+    function drawHeads(x, y, kvColorOf) {
+      const hw = 30, gap = 8;
+      for (let i = 0; i < H; i++) {
+        svg.appendChild(box(x + i * (hw + gap), y, hw, 26, C.token, { opacity: .9, r: 5 }));
+        svg.appendChild(txt(x + i * (hw + gap) + hw / 2, y + 17, "Q" + (i + 1), "svg-label",
+          { "text-anchor": "middle", "font-size": "9", fill: "#06121f" }));
+      }
+      return { hw, gap, totalW: H * (hw + gap) - gap };
+    }
+
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(txt(28, 28, "HOW MUCH K/V DOES EACH VARIANT STORE?", "svg-label",
+        { "letter-spacing": "1.2", fill: C.faint }));
+
+      const keys = ["MHA", "MQA", "GQA", "MLA"];
+      const cur = keys[step];
+      const V = VARIANTS[cur];
+
+      // ---- left: heads + stored K/V illustration ----
+      const x = 40, y = 90;
+      svg.appendChild(txt(x, y - 14, V.label, "svg-title", { "font-size": "15", fill: C.text }));
+      const geo = drawHeads(x, y, null);
+      const kvY = y + 90;
+
+      if (cur === "MHA") {
+        // one K/V per head
+        for (let i = 0; i < H; i++) {
+          const hx = x + i * (geo.hw + geo.gap);
+          arrow(svg, hx + geo.hw / 2, y + 26, hx + geo.hw / 2, kvY, C.kv, clamp(p * 1.4 - i * .05, 0, 1));
+          svg.appendChild(box(hx, kvY, geo.hw, 30, C.kv, { opacity: .9, r: 5 }));
+          svg.appendChild(txt(hx + geo.hw / 2, kvY + 20, "KV", "svg-label", { "text-anchor": "middle", "font-size": "9", fill: "#06121f" }));
+        }
+        svg.appendChild(txt(x, kvY + 52, "8 heads → 8 separate K,V  (largest cache)", "svg-label", { "font-size": "11.5", fill: C.muted }));
+      } else if (cur === "MQA") {
+        // single shared K/V
+        const sx = x + geo.totalW / 2 - 28;
+        svg.appendChild(box(sx, kvY, 56, 30, C.kv, { opacity: .95, r: 6, stroke: C.kv, sw: 1 }));
+        svg.appendChild(txt(sx + 28, kvY + 20, "1 KV", "svg-label", { "text-anchor": "middle", "font-size": "10", fill: "#06121f" }));
+        for (let i = 0; i < H; i++) {
+          const hx = x + i * (geo.hw + geo.gap) + geo.hw / 2;
+          arrow(svg, hx, y + 26, sx + 28, kvY, C.kv, clamp(p * 1.3 - i * .04, 0, 1));
+        }
+        svg.appendChild(txt(x, kvY + 52, "all 8 heads share one K,V  (memory ÷ h)", "svg-label", { "font-size": "11.5", fill: C.muted }));
+      } else if (cur === "GQA") {
+        // two groups
+        const half = H / 2;
+        [0, 1].forEach(g => {
+          const gx = x + g * half * (geo.hw + geo.gap) + (half * (geo.hw + geo.gap) - geo.gap) / 2 - 24;
+          svg.appendChild(box(gx, kvY, 48, 30, C.kv, { opacity: .95, r: 6 }));
+          svg.appendChild(txt(gx + 24, kvY + 20, "KV" + (g + 1), "svg-label", { "text-anchor": "middle", "font-size": "9.5", fill: "#06121f" }));
+          for (let i = 0; i < half; i++) {
+            const hi = g * half + i;
+            const hx = x + hi * (geo.hw + geo.gap) + geo.hw / 2;
+            arrow(svg, hx, y + 26, gx + 24, kvY, C.kv, clamp(p * 1.3 - hi * .03, 0, 1));
+          }
+        });
+        svg.appendChild(txt(x, kvY + 52, "g=2 groups share K,V  (memory ÷ h/g)", "svg-label", { "font-size": "11.5", fill: C.muted }));
+      } else if (cur === "MLA") {
+        // shared compressed latent, decompressed per head
+        const lx = x + geo.totalW / 2 - 34;
+        svg.appendChild(box(lx, kvY, 68, 30, C.compute, { opacity: .95, r: 6 }));
+        svg.appendChild(txt(lx + 34, kvY + 20, "latent", "svg-label", { "text-anchor": "middle", "font-size": "10", fill: "#06121f" }));
+        svg.appendChild(txt(lx + 34, kvY + 46, "W^D compresses → W^U decompresses per head", "svg-label",
+          { "text-anchor": "middle", "font-size": "10.5", fill: C.compute }));
+        for (let i = 0; i < H; i++) {
+          const hx = x + i * (geo.hw + geo.gap) + geo.hw / 2;
+          // decompress arrows back up (compute color)
+          arrow(svg, lx + 34, kvY, hx, y + 26, C.compute, clamp(p * 1.3 - i * .04, 0, 1));
+        }
+        svg.appendChild(txt(x, kvY + 70, "one small latent per token, unique K,V per head  (GQA-like memory, MHA-like quality)",
+          "svg-label", { "font-size": "11", fill: C.muted }));
+      }
+
+      // ---- right: relative memory bars (all 4 always shown, current highlighted) ----
+      const bx = 600, by = 96, bw = 230, rowH = 56;
+      svg.appendChild(txt(bx, by - 16, "relative KV memory", "svg-label", { fill: C.muted }));
+      keys.forEach((kk, i) => {
+        const yy = by + i * rowH;
+        const isCur = kk === cur;
+        const full = VARIANTS[kk].mem;
+        const w = Math.max(14, full * bw);
+        const grow = isCur ? clamp(p * 1.3, 0, 1) : 1;
+        svg.appendChild(box(bx, yy, bw, 26, C.panel, { r: 6, stroke: C.borderSoft }));
+        svg.appendChild(box(bx, yy, w * grow, 26, C.mem, { opacity: isCur ? .95 : .5, r: 6 }));
+        svg.appendChild(txt(bx - 8, yy + 18, kk, "svg-label",
+          { "text-anchor": "end", "font-size": "12", fill: isCur ? C.text : C.faint, "font-weight": isCur ? "700" : "400" }));
+        svg.appendChild(txt(bx + bw + 8, yy + 18, "×" + full.toFixed(2), "svg-label",
+          { "font-size": "11", fill: isCur ? C.mem : C.faint }));
+      });
+      svg.appendChild(txt(bx, by + 4 * rowH - 6, "fewer distinct K,V  →  smaller cache", "svg-label",
+        { "font-size": "11", fill: C.faint }));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl4"),
+      caption: document.getElementById("cap4"),
+      captions: [
+        "<b>MHA — Multi-Head Attention.</b> Every head owns its <span class='k'>W^K, W^V</span>, so it stores its own K and V. Maximum expressiveness, but the KV cache is the largest — 8 heads means 8 copies.",
+        "<b>MQA — Multi-Query Attention.</b> One <span class='k'>K,V</span> pair is shared by all heads (each keeps its own W^Q). The cache shrinks by a factor of <span class='k'>h</span> — at some cost to quality.",
+        "<b>GQA — Grouped-Query Attention.</b> Heads form <span class='k'>g</span> groups that share K,V — a tunable middle ground (g=h is MHA, g=1 is MQA). Quality ≈ MHA, memory ÷ h/g. An MHA model converts via <span class='k'>mean pooling</span> + only ~5% uptraining.",
+        "<b>MLA — Multi-head Latent Attention.</b> Store one small <span class='k'>compressed latent</span> per token (low-rank <span class='k'>W^D · W^U</span>); each head decompresses its own K,V. Reaches GQA-like memory with MHA-like (or better) quality.",
+      ],
+      render,
+      dwell: 2400,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 5 — Mixture-of-Experts (Loop) =====================
+  (function () {
+    const svg = document.getElementById("svg5");
+    const NEXP = 6, TOPK = 2;
+    // deterministic routing per "token tick" so the picture is legible
+    function pickTopK(tick) {
+      // pseudo-random but stable choices that move over time and stay balanced-ish
+      const order = [0, 1, 2, 3, 4, 5];
+      const a = (tick * 2 + 1) % NEXP;
+      const b = (tick * 3 + 2) % NEXP;
+      const sel = b === a ? [a, (a + 1) % NEXP] : [a, b];
+      return sel;
+    }
+
+    let load = new Array(NEXP).fill(0);   // running activation counts for the balance meter
+    let lastTick = -1;
+
+    function render(t) {
+      clear(svg);
+      const TICK = 1.6;
+      const tick = Math.floor(t / TICK);
+      const ph = (t % TICK) / TICK;
+      const sel = pickTopK(tick);
+      if (tick !== lastTick) { lastTick = tick; load[sel[0]]++; load[sel[1]]++; }
+
+      svg.appendChild(txt(28, 26, "ATTENTION UNCHANGED · DENSE FFN → MANY EXPERT FFNs", "svg-label",
+        { "letter-spacing": "1", fill: C.faint }));
+
+      // attention block (unchanged) on far left
+      const aX = 30, aY = 120;
+      svg.appendChild(box(aX, aY, 96, 90, C.card, { stroke: C.border, r: 10 }));
+      svg.appendChild(txt(aX + 48, aY + 40, "attention", "svg-title", { "text-anchor": "middle", "font-size": "12.5", fill: C.text }));
+      svg.appendChild(txt(aX + 48, aY + 58, "(unchanged)", "svg-label", { "text-anchor": "middle", "font-size": "10", fill: C.muted }));
+
+      // token leaving attention
+      const tokX = aX + 96, tokY = aY + 45;
+      const routerX = 230, routerY = aY + 5;
+      arrow(svg, tokX, tokY, routerX, routerY + 40, C.token, clamp(ph / .2, 0, 1));
+      // the moving token
+      const mtx = lerp(tokX + 6, routerX - 6, clamp(ph / .35, 0, 1));
+      svg.appendChild(S("circle", { cx: mtx, cy: lerp(tokY, routerY + 40, clamp(ph / .35, 0, 1)), r: 9, fill: C.token }));
+
+      // router
+      svg.appendChild(box(routerX, routerY, 90, 80, C.weight, { opacity: .9, r: 10 }));
+      svg.appendChild(txt(routerX + 45, routerY + 36, "router", "svg-title", { "text-anchor": "middle", "font-size": "13", fill: "#06121f" }));
+      svg.appendChild(txt(routerX + 45, routerY + 54, "top-" + TOPK, "svg-label", { "text-anchor": "middle", "font-size": "11", fill: "#06121f" }));
+
+      // experts column
+      const eX = 470, eY0 = 56, eGap = 46, ew = 150, eh = 34;
+      svg.appendChild(txt(eX, eY0 - 16, NEXP + " expert FFNs", "svg-label", { fill: C.muted }));
+      for (let i = 0; i < NEXP; i++) {
+        const y = eY0 + i * eGap;
+        const active = sel.includes(i);
+        const fire = active && ph > .35;
+        svg.appendChild(box(eX, y, ew, eh, active ? C.compute : C.card,
+          { opacity: active ? (fire ? .95 : .55) : 1, r: 8, stroke: active ? C.compute : C.border, sw: active ? 1.6 : 1 }));
+        svg.appendChild(txt(eX + 12, y + 22, "expert " + (i + 1), "svg-label",
+          { "font-size": "12", fill: active ? "#06121f" : C.faint }));
+        // routing wire from router to active experts
+        if (active) {
+          arrow(svg, routerX + 90, routerY + 40, eX, y + eh / 2, C.weight, clamp((ph - .15) / .3, 0, 1));
+        }
+        // gate weight chip on active experts
+        if (active) {
+          const g = i === sel[0] ? 0.66 : 0.34;
+          svg.appendChild(txt(eX + ew - 10, y + 22, "g=" + g.toFixed(2), "svg-label",
+            { "text-anchor": "end", "font-size": "10", fill: "#06121f" }));
+        }
+      }
+
+      // combine (weighted sum) → output
+      const sumX = 700, sumY = 150;
+      sel.forEach((i) => {
+        const y = eY0 + i * eGap + eh / 2;
+        arrow(svg, eX + ew, y, sumX, sumY + 22, C.compute, clamp((ph - .45) / .35, 0, 1));
+      });
+      svg.appendChild(S("circle", { cx: sumX + 22, cy: sumY + 22, r: 22, fill: C.card, stroke: C.compute, "stroke-width": 1.6 }));
+      svg.appendChild(txt(sumX + 22, sumY + 28, "Σ", "svg-title", { "text-anchor": "middle", "font-size": "20", fill: C.compute }));
+      svg.appendChild(txt(sumX + 22, sumY + 60, "weighted sum", "svg-label", { "text-anchor": "middle", "font-size": "10", fill: C.muted }));
+      arrow(svg, sumX + 44, sumY + 22, 830, sumY + 22, C.token, clamp((ph - .7) / .25, 0, 1));
+      svg.appendChild(box(836, sumY + 4, 60, 36, C.token, { opacity: .85, r: 7 }));
+      svg.appendChild(txt(866, sumY + 27, "out", "svg-label", { "text-anchor": "middle", "font-size": "11", fill: "#06121f" }));
+
+      // ---- load-balance meter ----
+      const total = load.reduce((a, b) => a + b, 0) || 1;
+      const mx = 470, my = 332, mw = 360;
+      svg.appendChild(txt(mx, my - 10, "load balance (tokens per expert)", "svg-label", { "font-size": "11", fill: C.muted }));
+      const slot = mw / NEXP;
+      // ideal line
+      for (let i = 0; i < NEXP; i++) {
+        const share = load[i] / total;
+        const bh = 26 * (share * NEXP); // scaled so even = full
+        const bxx = mx + i * slot;
+        svg.appendChild(box(bxx, my + 24 - Math.min(bh, 26), slot - 6, Math.min(bh, 26),
+          sel.includes(i) ? C.compute : C.mem, { opacity: .7, r: 2 }));
+      }
+      svg.appendChild(S("line", { x1: mx, y1: my + 24 - 26, x2: mx + mw - 6, y2: my + 24 - 26, stroke: C.warn, "stroke-dasharray": "4 4", "stroke-width": 1, opacity: .6 }));
+      svg.appendChild(txt(mx + mw + 6, my + 24 - 24, "even", "svg-label", { "font-size": "9.5", fill: C.warn }));
+
+      svg.appendChild(txt(30, 332 + 24, "auxiliary loss", "svg-label", { "font-size": "11.5", fill: C.warn }));
+      svg.appendChild(txt(30, 332 + 40, "keeps it even", "svg-label", { "font-size": "11.5", fill: C.muted }));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl5"), render, autoplay: true, speed: 1 });
+  })();
+  </script>
+</body>
+</html>

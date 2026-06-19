@@ -1,0 +1,652 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE 8 — KV Cache Management and Offload
+     Prefix caching · RadixAttention tree · KV offload hierarchy.
+     Uses shared.css + shared.js only. Offline / self-contained.
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KV Cache Management and Offload — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;8 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/kvoffload/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 8 · Serving at scale</div>
+      <h1>KV Cache Management and Offload</h1>
+      <p class="lead">Real workloads aren't one-and-done. Requests share long prefixes — system prompts,
+      few-shot examples, chat history. If we keep those KV blocks around, we can <em>reuse</em> them instead of
+      recomputing, and tier colder blocks down a memory hierarchy when HBM runs out.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Prefix caching (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Prefix caching: compute the shared prefix once, reuse it</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Three requests share a long system prompt. The prefix KV is computed on the first request
+      and reused on the rest — only each request's unique suffix needs fresh prefill.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 360" role="img" aria-label="Three requests sharing a cached KV prefix; only unique suffixes are recomputed"></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> request tokens</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV block (prefix)</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> cache hit (reused KV)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> recompute (prefill)</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The KV cache normally trades compute for memory <em>within</em> one request, then is discarded.
+      <strong>Prefix caching</strong> (a.k.a. prompt caching) lets parts of that cache <strong>outlive a request</strong>
+      and be reused across later, non-concurrent requests. The win is largest when a big preamble — a long
+      system prompt or a multi-turn history — is identical across many requests. But how do we know what's
+      already cached, and how much of a new prompt matches? That's what the index below answers.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — RadixAttention tree (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>RadixAttention: indexing prefixes in a radix tree</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Cached prefixes live in a radix tree keyed by tokens. A new request walks the tree, reuses
+      the longest matching prefix, and branches off for its new tokens. Cold branches are evicted by LRU.</p>
+
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 380" role="img" aria-label="A radix tree of cached token prefixes; a new request matches the longest prefix then branches, and a cold branch is evicted by LRU"></svg>
+      </div>
+
+      <div id="ctrl2"></div>
+      <div id="cap2" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> cached node (KV)</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> matched / reused path</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> new request branch</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> LRU eviction</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Why exact match</span>
+      RadixAttention matches <strong>token-by-token, exactly</strong>. Even minimal reordering or a one-token
+      change to the prompt breaks the match and forces a miss. (Later systems like <code>LMCache</code> and
+      <code>CacheBlend</code> relax this by hashing chunks and reusing partial matches.)
+    </div>
+
+    <!-- ================= FIGURE 3 — KV offload hierarchy (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>KV offload: tiering blocks across the memory hierarchy</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">HBM is scarce, so colder prefix blocks are offloaded down a hierarchy — GPU&nbsp;HBM →
+      CPU&nbsp;DRAM → NVMe — and prefetched back up on a hit. Going down gains capacity but loses bandwidth.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 400" role="img" aria-label="A KV block being evicted down from GPU HBM to CPU DRAM to NVMe and then prefetched back up to HBM on a cache hit"></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+      <div id="cap3" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> memory tier</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV block</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> eviction (move down)</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> prefetch (load up)</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Caching prefixes in HBM eats into the memory available for active request decoding, so as contexts
+      grow, something has to give. Systems like <code>LMCache</code> delegate offload to host DRAM, local NVMe,
+      or remote hosts. Two tricks make this fast: <strong>aggregating</strong> the paged-out KV into one big
+      contiguous buffer (instead of many tiny I/Os), and fetching <strong>layer by layer while overlapping I/O
+      with compute</strong> so the request doesn't stall. The loop below shows the decision that makes offload
+      worth it.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — Load vs recompute (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Putting it together: load the KV, don't recompute it</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">On a prefix hit served from an offloaded tier, loading the cached KV beats re-running
+      prefill. The two lanes race; loading from DRAM/NVMe wins when the prefix is long.</p>
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 300" role="img" aria-label="Two lanes race: recomputing prefill versus loading cached KV from an offloaded tier; loading finishes first"></svg>
+      </div>
+      <div id="ctrl4"></div>
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> recompute prefill (GPU)</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> load cached KV (offloaded)</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV ready</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">When loading wins</span>
+      Loading beats recompute when the cached prefix is <strong>long</strong> and the link is fast enough.
+      Context-truncation tricks (like attention sinks) shrink the live cache but <em>hurt</em> hit rate — two
+      otherwise-identical prompts that dropped different tokens no longer match. As a rule, cache offload works
+      best <strong>without</strong> truncation.
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m07-disaggregation.html"><span class="dir">← Previous</span><span class="ttl">Prefill-Decode Scheduling and Disaggregation</span></a>
+      <a class="next" href="m09-training.html"><span class="dir">Next →</span><span class="ttl">Appendix: Overview of Training</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  // ===================== shared little helpers =====================
+  const { S, C, clear, lerp, ease, easeOut, easeIn, rr, clamp } = IOP;
+
+  // a token-block (small rounded rect with optional letter)
+  function tokBlock(x, y, w, h, fill, op, label) {
+    const g = S("g", {});
+    g.appendChild(S("path", { d: rr(x, y, w, h, 4), fill: fill, opacity: op == null ? 1 : op }));
+    if (label != null) g.appendChild(S("text", {
+      x: x + w / 2, y: y + h / 2 + 4, "text-anchor": "middle",
+      "font-family": "var(--mono)", "font-size": 11, fill: "#06121f", "font-weight": 700, text: label
+    }));
+    return g;
+  }
+  function txt(x, y, s, cls, anchor, size, fill) {
+    return S("text", {
+      x, y, "text-anchor": anchor || "start",
+      "font-family": cls === "mono" ? "var(--mono)" : "var(--font)",
+      "font-size": size || 12, fill: fill || C.muted, text: s
+    });
+  }
+
+  // ============================================================================
+  // FIGURE 1 — Prefix caching: shared prefix computed once, reused.
+  // ============================================================================
+  (function () {
+    const svg = document.getElementById("svg1");
+    const PREFIX = 8;                 // shared prefix length (blocks)
+    const SUFFIX = [4, 5, 3];         // unique suffix length per request
+    const BW = 30, BH = 26, GAP = 3;
+    const rowY = [70, 150, 230];
+    const x0 = 150;
+
+    function reqLabel(i) { return ["R1", "R2", "R3"][i]; }
+
+    function render(step, p) {
+      clear(svg);
+
+      // title strip
+      svg.appendChild(txt(150, 36, "Shared system prompt  (prefix)", "mono", "start", 12, C.muted));
+      svg.appendChild(txt(150 + PREFIX * (BW + GAP) + 16, 36, "unique suffix", "mono", "start", 12, C.faint));
+
+      // bracket over prefix region
+      const px1 = x0, px2 = x0 + PREFIX * (BW + GAP) - GAP;
+      svg.appendChild(S("path", { d: `M${px1},44 v6 H${px2} v-6`, fill: "none", stroke: C.faint, "stroke-width": 1, opacity: .6 }));
+
+      // Is the prefix cached yet? It becomes cached during step 1 (R1 prefill).
+      const prefixCached = step >= 2;            // after R1 finished prefilling
+
+      for (let r = 0; r < 3; r++) {
+        const y = rowY[r];
+        // row label
+        svg.appendChild(txt(x0 - 92, y + BH / 2 + 4, reqLabel(r) + " request", "mono", "start", 12, C.text));
+
+        // ---- prefix blocks ----
+        for (let i = 0; i < PREFIX; i++) {
+          const bx = x0 + i * (BW + GAP);
+          let fill = C.kv, op = .28, lab = null;
+
+          if (r === 0) {
+            // R1 computes the prefix during step 1
+            if (step === 0) { fill = C.token; op = .85; }
+            else if (step === 1) {
+              // prefill sweeping across prefix (warn = recompute), reveal up to p
+              const reveal = Math.floor(p * PREFIX + 0.001);
+              if (i < reveal) { fill = C.kv; op = .95; }
+              else if (i === reveal) { fill = C.warn; op = .95; }
+              else { fill = C.token; op = .85; }
+            } else { fill = C.kv; op = .95; }   // cached
+          } else {
+            // R2 / R3
+            if (!prefixCached) { fill = C.token; op = .22; }       // not yet active
+            else {
+              // these requests reuse the cached prefix -> green hit
+              const myStep = r === 1 ? 3 : 4;
+              if (step < myStep) { fill = C.kv; op = .35; }
+              else if (step === myStep) {
+                // hit sweep
+                const reveal = Math.floor(p * PREFIX + 0.001);
+                fill = i <= reveal ? C.good : C.kv;
+                op = i <= reveal ? .95 : .45;
+              } else { fill = C.good; op = .9; }
+            }
+          }
+          svg.appendChild(tokBlock(bx, y, BW, BH, fill, op));
+        }
+
+        // ---- suffix blocks (unique, always need prefill = warn then cyan) ----
+        const sx0 = x0 + PREFIX * (BW + GAP) + 14;
+        for (let i = 0; i < SUFFIX[r]; i++) {
+          const bx = sx0 + i * (BW + GAP);
+          let fill = C.token, op = .22;
+          const myStep = r === 0 ? 1 : (r === 1 ? 3 : 4);
+          if (step === myStep) {
+            const reveal = p * SUFFIX[r];
+            if (i < reveal - 1) { fill = C.token; op = .9; }
+            else if (i < reveal) { fill = C.warn; op = .95; }
+            else { fill = C.token; op = .3; }
+          } else if (step > myStep) { fill = C.token; op = .9; }
+          else if ((r === 1 && step >= 2) || (r === 2 && step >= 3)) { fill = C.token; op = .3; }
+          svg.appendChild(tokBlock(bx, y, BW, BH, fill, op));
+        }
+      }
+
+      // ---- savings tally ----
+      if (step >= 5) {
+        const computed = PREFIX + SUFFIX[0] + SUFFIX[1] + SUFFIX[2];          // actually prefilled
+        const naive = PREFIX * 3 + SUFFIX[0] + SUFFIX[1] + SUFFIX[2];         // if no caching
+        const saved = naive - computed;
+        svg.appendChild(S("path", { d: rr(150, 300, 620, 44, 8), fill: C.good, opacity: .12 }));
+        svg.appendChild(S("path", { d: rr(150, 300, 620, 44, 8), fill: "none", stroke: C.good, opacity: .5 }));
+        svg.appendChild(txt(168, 327, "Prefix computed once, reused twice  →  " + saved + " of " + naive + " token-prefills skipped  (" +
+          Math.round(100 * saved / naive) + "% less prefill)", "font", "start", 14, C.text));
+      } else {
+        svg.appendChild(txt(150, 326, "Each request = a shared prefix + a short unique suffix.", "font", "start", 13, C.faint));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption: document.getElementById("cap1"),
+      captions: [
+        "<b>Setup.</b> Three requests (R1–R3) all begin with the <span class='k'>same long prefix</span> — a shared system prompt — then diverge into a short, unique <span class='k'>suffix</span>.",
+        "<b>R1 — cold start.</b> Nothing is cached yet, so R1 runs <span class='k'>full prefill</span> over the whole prompt. As it sweeps, each prefix token's <span class='k'>KV block</span> is computed and stored.",
+        "<b>Prefix now cached.</b> R1's prefix KV <span class='k'>outlives the request</span> and stays resident, ready for reuse by later, non-concurrent requests.",
+        "<b>R2 — cache hit.</b> R2's prefix matches, so those KV blocks are <span class='k'>reused for free</span> (green). Only R2's unique suffix needs fresh prefill.",
+        "<b>R3 — cache hit again.</b> Same story: the shared prefix is a <span class='k'>hit</span>, only the new suffix is recomputed. The expensive part is paid once for all three.",
+        "<b>Payoff.</b> <span class='k'>Prefix caching</span> turned three full prefills into one prefix-prefill plus three tiny suffixes — a big drop in prefill work and response latency.",
+      ],
+      render, dwell: 2100, transition: 700, autoplay: false,
+    });
+  })();
+
+  // ============================================================================
+  // FIGURE 2 — RadixAttention: radix tree of cached prefixes.
+  // Layout: root -> shared system-prompt node -> two branches (chat A / chat B).
+  // New request matches A's prefix then branches; cold branch B is LRU-evicted.
+  // ============================================================================
+  (function () {
+    const svg = document.getElementById("svg2");
+
+    // node positions (id -> {x,y,w,label})
+    const N = {
+      root: { x: 60,  y: 175, w: 70,  label: "root" },
+      sys:  { x: 165, y: 175, w: 150, label: "“You are a…”" },
+      a:    { x: 350, y: 105, w: 130, label: "…weather?" },
+      a2:   { x: 515, y: 105, w: 120, label: "…tomorrow" },
+      b:    { x: 350, y: 250, w: 130, label: "…poem?" },
+      b2:   { x: 515, y: 250, w: 130, label: "…haiku" },
+      nu:   { x: 515, y: 175, w: 150, label: "…and Friday?" },  // new request branch
+    };
+    const EDGES = [
+      ["root", "sys"], ["sys", "a"], ["a", "a2"],
+      ["sys", "b"], ["b", "b2"],
+    ];
+    const H = 40;
+    const cy = (n) => n.y + H / 2;
+
+    function nodeRect(n, fill, op, strokeC, dashed) {
+      const g = S("g", {});
+      g.appendChild(S("path", {
+        d: rr(n.x, n.y, n.w, H, 8), fill: fill, opacity: op,
+        stroke: strokeC || "none", "stroke-width": strokeC ? 1.6 : 0,
+        "stroke-dasharray": dashed ? "5 4" : null
+      }));
+      g.appendChild(S("text", {
+        x: n.x + n.w / 2, y: n.y + H / 2 + 4, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 12,
+        fill: op > .5 ? "#06121f" : C.muted, "font-weight": 600, text: n.label
+      }));
+      return g;
+    }
+    function edge(p, q, col, w, op, dash) {
+      const x1 = p.x + p.w, y1 = cy(p), x2 = q.x, y2 = cy(q);
+      const mx = (x1 + x2) / 2;
+      return S("path", {
+        d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,
+        fill: "none", stroke: col || C.border, "stroke-width": w || 2,
+        opacity: op == null ? 1 : op, "stroke-dasharray": dash || null
+      });
+    }
+
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(txt(60, 34, "Radix tree of cached token prefixes", "mono", "start", 13, C.muted));
+      svg.appendChild(txt(60, 52, "each node ▸ a span of tokens ▸ its KV cache entry", "font", "start", 12, C.faint));
+
+      // which path is "matched" (green) — root→sys→a is the longest match for the new request
+      const matchPath = step >= 1;
+      const branchShown = step >= 2;
+      const evictB = step >= 3;
+
+      // ---- base edges ----
+      EDGES.forEach(([u, v]) => {
+        const onMatch = matchPath && ((u === "root" && v === "sys") || (u === "sys" && v === "a"));
+        let col = C.border, w = 2, op = .85;
+        if (evictB && (v === "b" || v === "b2")) { col = C.warn; op = .25; }
+        if (onMatch) { col = C.good; w = 3; }
+        svg.appendChild(edge(N[u], N[v], col, w, op));
+      });
+      // a2 edge (part of cached tree, not on the new match beyond 'a')
+      svg.appendChild(edge(N.a, N.a2, C.border, 2, evictB && false ? .3 : .85));
+
+      // ---- new-request branch edge (sys -> nu) appears at step 2 ----
+      if (branchShown) {
+        const pp = step === 2 ? ease(p) : 1;
+        // draw partial cubic by interpolating endpoint
+        const u = N.a, q = N.nu;            // branch hangs off the matched node 'a'
+        const x1 = u.x + u.w, y1 = cy(u), x2 = q.x, y2 = cy(q);
+        const ex = lerp(x1, x2, pp), ey = lerp(y1, y2, pp);
+        const mx = (x1 + ex) / 2;
+        svg.appendChild(S("path", {
+          d: `M${x1},${y1} C${mx},${y1} ${mx},${ey} ${ex},${ey}`,
+          fill: "none", stroke: C.token, "stroke-width": 3, opacity: .95, "stroke-dasharray": "6 4"
+        }));
+      }
+
+      // ---- nodes ----
+      // cached nodes (amber)
+      const cached = ["root", "sys", "a", "a2", "b", "b2"];
+      cached.forEach(id => {
+        const n = N[id];
+        let fill = C.kv, op = .9, stroke = null, dash = false;
+        if (id === "root") { fill = C.raised; op = 1; }
+        if (matchPath && (id === "sys" || id === "a")) { fill = C.good; op = .95; }
+        if (matchPath && id === "root") { /* root stays neutral */ }
+        if (evictB && (id === "b" || id === "b2")) {
+          fill = C.warn;
+          op = step === 3 ? lerp(.9, .15, ease(p)) : .15;
+          stroke = C.warn; dash = true;
+        }
+        svg.appendChild(nodeRect(n, fill, op, stroke, dash));
+      });
+
+      // new-request node (cyan) — fades in at step 2
+      if (branchShown) {
+        const n = N.nu;
+        const op = step === 2 ? ease(p) : 1;
+        svg.appendChild(nodeRect(n, C.token, .92 * op, null, false));
+      }
+
+      // ---- annotations ----
+      if (step === 0) {
+        svg.appendChild(txt(350, 330, "Two prior chats (A, B) share the same system-prompt node, then diverge.", "font", "start", 13, C.faint));
+      }
+      if (matchPath) {
+        // marker on matched span
+        svg.appendChild(S("path", { d: rr(165, 145, 320, 4, 2), fill: C.good, opacity: 0 }));
+        svg.appendChild(txt(165, 92, "longest matched prefix →", "mono", "start", 12, C.good));
+      }
+      if (branchShown && step === 2) {
+        svg.appendChild(txt(515, 162, "new tokens branch off", "mono", "start", 11.5, C.token));
+      }
+      if (evictB) {
+        svg.appendChild(txt(350, 318, "Branch B is the least-recently-used → evicted to free memory.", "font", "start", 13, C.warn));
+        svg.appendChild(S("line", { x1: 343, y1: 270, x2: 657, y2: 270, stroke: C.warn, "stroke-width": 1, opacity: .35, "stroke-dasharray": "4 4" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl2"),
+      caption: document.getElementById("cap2"),
+      captions: [
+        "<b>The index.</b> Cached prefixes are stored in a <span class='k'>radix tree</span>: each node is a span of tokens pointing at its KV entry. Two earlier chats share the system-prompt node, then split into branches A and B.",
+        "<b>Walk &amp; match.</b> A new request walks the tree token-by-token and finds the <span class='k'>longest matching prefix</span> — here root → system prompt → branch A. Those KV blocks are a <span class='k'>hit</span> (green) and reused.",
+        "<b>Branch off.</b> Where the new request's tokens diverge from anything cached, it <span class='k'>branches</span> and only those new tokens (cyan) are prefilled and added to the tree.",
+        "<b>LRU eviction.</b> HBM is finite. The coldest branch — least-recently-used B — is <span class='k'>evicted</span> to reclaim space, while hot, recently-matched paths stay resident.",
+      ],
+      render, dwell: 2200, transition: 700, autoplay: false,
+    });
+  })();
+
+  // ============================================================================
+  // FIGURE 3 — KV offload across the memory hierarchy.
+  // Three tiers (HBM / DRAM / NVMe). A cold block is evicted downward, then
+  // prefetched back up on a hit. Shows capacity vs bandwidth tradeoff.
+  // ============================================================================
+  (function () {
+    const svg = document.getElementById("svg3");
+
+    const TIERS = [
+      { key: "hbm",  name: "GPU HBM",   sub: "~3 TB/s · tens of GB",  y: 70,  cap: 4 },
+      { key: "dram", name: "CPU DRAM",  sub: "~50 GB/s · hundreds of GB", y: 175, cap: 7 },
+      { key: "nvme", name: "NVMe / disk", sub: "~5 GB/s · terabytes", y: 280, cap: 10 },
+    ];
+    const TX = 250, TW = 520, TH = 64;     // tier rack geometry
+    const SLOT = 40, SLOTH = 38, SGAP = 8;
+
+    // moving block start (in HBM, slot index 3) ; we animate it.
+    function slotX(idx) { return TX + 16 + idx * (SLOT + SGAP); }
+
+    function tierRow(t, dim) {
+      const g = S("g", {});
+      g.appendChild(S("path", { d: rr(TX, t.y, TW, TH, 10), fill: C.mem, opacity: dim ? .07 : .12 }));
+      g.appendChild(S("path", { d: rr(TX, t.y, TW, TH, 10), fill: "none", stroke: C.mem, opacity: dim ? .25 : .55, "stroke-width": 1.4 }));
+      // label block on the left
+      g.appendChild(S("text", { x: 60, y: t.y + 26, "font-family": "var(--font)", "font-size": 15, "font-weight": 700, fill: C.text, text: t.name }));
+      g.appendChild(S("text", { x: 60, y: t.y + 46, "font-family": "var(--mono)", "font-size": 11.5, fill: C.faint, text: t.sub }));
+      return g;
+    }
+
+    // bandwidth / capacity gauges on the right side
+    function gauges() {
+      const g = S("g", {});
+      const gx = TX + TW + 22;
+      g.appendChild(txt(gx, 56, "bandwidth", "mono", "start", 10.5, C.faint));
+      g.appendChild(txt(gx + 86, 56, "capacity", "mono", "start", 10.5, C.faint));
+      TIERS.forEach((t, i) => {
+        const cy = t.y + TH / 2;
+        const bw = [1.0, 0.42, 0.16][i];     // relative bandwidth bar
+        const cap = [0.22, 0.55, 1.0][i];    // relative capacity bar
+        // bandwidth (good→down) decreasing
+        g.appendChild(S("path", { d: rr(gx, cy - 6, 78 * bw, 12, 3), fill: C.good, opacity: .55 }));
+        g.appendChild(S("path", { d: rr(gx, cy - 6, 78, 12, 3), fill: "none", stroke: C.border, opacity: .5 }));
+        // capacity increasing
+        g.appendChild(S("path", { d: rr(gx + 86, cy - 6, 78 * cap, 12, 3), fill: C.mem, opacity: .55 }));
+        g.appendChild(S("path", { d: rr(gx + 86, cy - 6, 78, 12, 3), fill: "none", stroke: C.border, opacity: .5 }));
+      });
+      // arrows summarizing the tradeoff
+      g.appendChild(txt(gx, t3bottom() + 24, "↓ bandwidth   ↑ capacity", "mono", "start", 11, C.muted));
+      return g;
+    }
+    function t3bottom() { return TIERS[2].y + TH; }
+
+    function arrow(x, y1, y2, col, op) {
+      const dir = y2 > y1 ? 1 : -1;
+      const g = S("g", {});
+      g.appendChild(S("line", { x1: x, y1: y1, x2: x, y2: y2 - dir * 9, stroke: col, "stroke-width": 2.4, opacity: op }));
+      g.appendChild(S("path", { d: `M${x - 6},${y2 - dir * 10} L${x + 6},${y2 - dir * 10} L${x},${y2} Z`, fill: col, opacity: op }));
+      return g;
+    }
+
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(txt(60, 36, "KV blocks tiered across the memory hierarchy", "mono", "start", 13, C.muted));
+
+      // dim tiers not currently involved? keep all lit, just emphasize movement.
+      TIERS.forEach(t => svg.appendChild(tierRow(t, false)));
+      svg.appendChild(gauges());
+
+      // resident blocks in HBM (3 static, amber) + 1 that we animate
+      const hbmY = TIERS[0].y + (TH - SLOTH) / 2;
+      const dramY = TIERS[1].y + (TH - SLOTH) / 2;
+      const nvmeY = TIERS[2].y + (TH - SLOTH) / 2;
+
+      for (let i = 0; i < 3; i++) {
+        svg.appendChild(tokBlock(slotX(i), hbmY, SLOT, SLOTH, C.kv, .55, "•"));
+      }
+
+      // The travelling block 'X'
+      // Phases by step:
+      // 0: X resident in HBM (cold, dim) ; HBM full warning
+      // 1: evict X downward HBM -> DRAM (warn arrow), X moves to DRAM
+      // 2: X colder still -> DRAM -> NVMe (offloaded to disk)
+      // 3: HIT! prefetch X back NVMe -> HBM (good arrow), overlap note
+      // 4: X resident & hot in HBM again, served
+      const startX = slotX(3);
+      let bx = startX, by = hbmY, fill = C.kv, op = .9, lab = "X";
+
+      if (step === 0) {
+        by = hbmY; fill = C.kv; op = .5; lab = "X";
+        // HBM pressure marker
+        svg.appendChild(S("path", { d: rr(TX, TIERS[0].y, TW, TH, 10), fill: "none", stroke: C.warn, opacity: .45, "stroke-width": 1.6, "stroke-dasharray": "6 5" }));
+        svg.appendChild(txt(TX + TW / 2, TIERS[0].y - 8, "HBM full — cold block X must make room", "mono", "middle", 12, C.warn));
+      } else if (step === 1) {
+        const e = ease(p);
+        bx = startX; by = lerp(hbmY, dramY, e);
+        fill = C.warn; op = .95;
+        svg.appendChild(arrow(startX + SLOT / 2, hbmY + SLOTH, dramY - 4, C.warn, .9));
+        svg.appendChild(txt(TX + TW / 2, (TIERS[0].y + TIERS[1].y) / 2 + 14, "evict ↓ HBM → DRAM", "mono", "middle", 12, C.warn));
+      } else if (step === 2) {
+        const e = ease(p);
+        bx = startX; by = lerp(dramY, nvmeY, e);
+        fill = C.warn; op = .9;
+        svg.appendChild(arrow(startX + SLOT / 2, dramY + SLOTH, nvmeY - 4, C.warn, .9));
+        svg.appendChild(txt(TX + TW / 2, (TIERS[1].y + TIERS[2].y) / 2 + 14, "still cold → offload to NVMe (cheap, slow)", "mono", "middle", 12, C.warn));
+      } else if (step === 3) {
+        const e = easeOut(p);
+        // hit: prefetch all the way back to HBM
+        by = lerp(nvmeY, hbmY, e);
+        bx = startX;
+        fill = C.good; op = .95;
+        svg.appendChild(arrow(startX + SLOT / 2 + 28, nvmeY, hbmY + SLOTH + 4, C.good, .9));
+        svg.appendChild(txt(TX + TW / 2, TIERS[2].y - 8, "cache hit — prefetch ↑ NVMe → HBM (overlap I/O with compute)", "mono", "middle", 12, C.good));
+      } else {
+        by = hbmY; bx = startX; fill = C.good; op = .95;
+        svg.appendChild(txt(TX + TW / 2, TIERS[0].y - 8, "X resident & hot — served from HBM, no recompute", "mono", "middle", 12, C.good));
+      }
+
+      svg.appendChild(tokBlock(bx, by, SLOT, SLOTH, fill, op, lab));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl3"),
+      caption: document.getElementById("cap3"),
+      captions: [
+        "<b>The hierarchy.</b> KV lives across tiers: fast, tiny <span class='k'>GPU HBM</span> on top; bigger, slower <span class='k'>CPU DRAM</span>; then huge, slow <span class='k'>NVMe/disk</span>. Going down trades <span class='k'>bandwidth for capacity</span>.",
+        "<b>Eviction.</b> HBM is full and block <span class='k'>X is cold</span>, so it's <span class='k'>offloaded down</span> to CPU DRAM — freeing HBM for active request decoding.",
+        "<b>Deeper offload.</b> If X stays unused, it's pushed further to <span class='k'>NVMe</span>: lots of capacity, low cost, but the slowest link.",
+        "<b>Hit → prefetch.</b> A later request needs X's prefix. Instead of recomputing, X is <span class='k'>prefetched back up</span> to HBM — fetched layer-by-layer with <span class='k'>I/O overlapped against compute</span> so the request doesn't stall.",
+        "<b>Served.</b> X is hot in HBM again and reused directly — we <span class='k'>loaded the KV instead of recomputing</span> it.",
+      ],
+      render, dwell: 2100, transition: 750, autoplay: false,
+    });
+  })();
+
+  // ============================================================================
+  // FIGURE 4 — Loop: load cached KV vs recompute prefill (a race).
+  // Two lanes fill toward "KV ready". Loading (green) finishes first.
+  // ============================================================================
+  (function () {
+    const svg = document.getElementById("svg4");
+    const laneX = 210, laneW = 560, laneH = 40;
+    const yA = 96, yB = 176;            // recompute, load
+    const goalX = laneX + laneW;
+
+    // Relative durations: recompute is slow (GPU does work per token),
+    // load is fast (one big batched read). Cycle ~ 4.2s.
+    const CYCLE = 4.4;
+    const tRecomp = 3.6;               // recompute reaches goal at t=3.6
+    const tLoad = 2.0;                 // load reaches goal at t=2.0
+
+    function laneBg(y, label, sub, col) {
+      const g = S("g", {});
+      g.appendChild(S("path", { d: rr(laneX, y, laneW, laneH, 9), fill: C.panel, opacity: 1 }));
+      g.appendChild(S("path", { d: rr(laneX, y, laneW, laneH, 9), fill: "none", stroke: C.border, opacity: .7 }));
+      g.appendChild(S("text", { x: 60, y: y + 18, "font-family": "var(--font)", "font-size": 13.5, "font-weight": 700, fill: col, text: label }));
+      g.appendChild(S("text", { x: 60, y: y + 35, "font-family": "var(--mono)", "font-size": 10.5, fill: C.faint, text: sub }));
+      return g;
+    }
+
+    function render(time) {
+      clear(svg);
+      const t = (time % CYCLE);
+
+      svg.appendChild(txt(60, 40, "Same prefix is a cache hit. Race: recompute it vs. load it.", "mono", "start", 13, C.muted));
+
+      // goal line
+      svg.appendChild(S("line", { x1: goalX + 8, y1: 78, x2: goalX + 8, y2: 234, stroke: C.kv, "stroke-width": 2, "stroke-dasharray": "5 5", opacity: .8 }));
+      svg.appendChild(txt(goalX + 14, 70, "KV ready", "mono", "start", 11.5, C.kv));
+
+      // ---- lane A: recompute (warn) ----
+      svg.appendChild(laneBg(yA, "Recompute prefill", "GPU runs attention over every prefix token", C.warn));
+      const pA = clamp(t / tRecomp, 0, 1);
+      // chunky token-by-token fill to suggest compute
+      const nTok = 16, tokW = (laneW - 8) / nTok;
+      const litA = Math.floor(pA * nTok);
+      for (let i = 0; i < nTok; i++) {
+        const on = i < litA;
+        svg.appendChild(S("path", { d: rr(laneX + 4 + i * tokW, yA + 5, tokW - 3, laneH - 10, 3),
+          fill: on ? C.warn : C.border, opacity: on ? .85 : .25 }));
+      }
+      const doneA = t >= tRecomp;
+      if (doneA) svg.appendChild(txt(goalX - 4, yA - 8, "done @ slow", "mono", "end", 11, C.warn));
+
+      // ---- lane B: load cached KV (good) ----
+      svg.appendChild(laneBg(yB, "Load cached KV", "one batched read from DRAM / NVMe, no math", C.good));
+      const pB = clamp(t / tLoad, 0, 1);
+      svg.appendChild(S("path", { d: rr(laneX + 4, yB + 5, (laneW - 8) * easeOut(pB), laneH - 10, 4), fill: C.good, opacity: .85 }));
+      // a small KV block riding the leading edge
+      const headX = laneX + 4 + (laneW - 8) * easeOut(pB);
+      svg.appendChild(tokBlock(Math.min(headX, goalX - 18) - 8, yB + 6, 18, laneH - 12, C.kv, .95));
+      const doneB = t >= tLoad;
+      if (doneB) {
+        svg.appendChild(txt(goalX - 4, yB - 8, "done first ✓", "mono", "end", 11, C.good));
+      }
+
+      // ---- verdict banner once load is done & before recompute ----
+      if (doneB && !doneA) {
+        svg.appendChild(S("path", { d: rr(laneX, 244, laneW, 34, 8), fill: C.good, opacity: .12 }));
+        svg.appendChild(txt(laneX + laneW / 2, 266, "Long prefix + fast link → loading beats recompute. Skip the prefill.", "font", "middle", 13.5, C.good));
+      } else if (doneA) {
+        svg.appendChild(txt(laneX + laneW / 2, 264, "Recompute finally catches up — but the GPU spent real work to get there.", "font", "middle", 13, C.faint));
+      } else {
+        svg.appendChild(txt(laneX + laneW / 2, 264, "Both racing toward a usable KV cache…", "font", "middle", 13, C.faint));
+      }
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl4"), render, autoplay: true, speed: 1 });
+  })();
+  </script>
+</body>
+</html>

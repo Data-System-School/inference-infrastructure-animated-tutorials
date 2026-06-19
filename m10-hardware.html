@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Appendix: GPU Hardware — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----------------------------- top nav ----------------------------- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;10 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/hardware/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Appendix · Module 10</div>
+      <h1>GPU Hardware</h1>
+      <p class="lead">A GPU is a throughput machine: thousands of tiny cores grouped into streaming
+      multiprocessors, fed by a steep memory hierarchy. These animations walk through how a kernel's
+      grid of thread blocks gets scheduled, how warps execute in lockstep, where data lives, and why
+      decode is so often bottlenecked by memory bandwidth rather than raw compute.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Execution model (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>The GPU execution model: grid → blocks → SMs → warps</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">A kernel launches a grid of thread blocks; the hardware dispatches blocks onto
+      many streaming multiprocessors, where threads run in 32-thread warps in SIMT lockstep.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 420" role="img" aria-label="A kernel grid of thread blocks dispatched to streaming multiprocessors, with threads running in warps"></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> kernel / grid</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> thread block dispatch</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> SM cores / threads at work</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> divergent / idle thread</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The contrast with a CPU is the whole point. A CPU has a few big, stateful cores tuned for
+      latency and complex control flow; a GPU has thousands of simple, <strong>stateless</strong> cores
+      organized for throughput. An <code>SM</code> — a Streaming Multiprocessor — is the unit that most
+      resembles a CPU core: it bundles cores, registers, caches, and a scheduler, and runs a huge amount
+      of simultaneous multithreading. (AMD calls these <em>Compute Units</em>, and the green CUDA Cores
+      are <em>Stream Processors</em>.)</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Many small cores vs few big (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Throughput vs latency: many small cores, not a few big ones</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">A CPU finishes a few items fast with big out-of-order cores; a GPU floods a huge
+      grid of simple cores and wins on total work per second. Watch both chew through the same workload.</p>
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 320" role="img" aria-label="A CPU with four large cores compared to a GPU with many small cores processing work in parallel"></svg>
+      </div>
+      <div id="ctrl2"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> CPU core (big, latency)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> GPU core (small, throughput)</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> work item in flight</span>
+      </div>
+    </section>
+
+    <!-- ================= FIGURE 3 — Memory hierarchy (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>The memory hierarchy: registers → SRAM → L2 → HBM</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">As you climb down the hierarchy capacity grows but bandwidth and latency get
+      worse. Keeping data high in the hierarchy is the single biggest lever for kernel performance.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 400" role="img" aria-label="The GPU memory hierarchy from register file to shared memory L1 to L2 cache to HBM, with capacity and bandwidth changing down the levels"></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+      <div id="cap3" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> memory level (SRAM / HBM)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> thread / SM accessing it</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV cache + weights live in HBM</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> data movement</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Ties back to Module 5</span>
+      <strong>FlashAttention is a memory-hierarchy trick.</strong> Naïve attention writes the full
+      <code>N×N</code> score matrix out to <em>HBM</em> and reads it back — a flood of slow global traffic.
+      FlashAttention instead streams <strong>tiles</strong> of Q, K and V into on-chip <em>SRAM</em>
+      (shared memory / L1), computes the softmax incrementally there, and never materializes the big
+      matrix in HBM. Same math, far less data movement — which is exactly why it is faster.
+    </div>
+
+    <!-- ================= FIGURE 4 — Kernels & Triton tiling (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Kernels &amp; Triton: one program instance, one tile</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">A kernel is a function run across the whole grid. CUDA (NVIDIA) and ROCm (AMD)
+      are the native stacks; Triton lets you write tiled kernels in Python where each program instance
+      owns one tile — load to SRAM, compute, write back.</p>
+
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 380" role="img" aria-label="A Triton program instance loading a tile of a matrix into SRAM, computing on it, and writing the result back to HBM"></svg>
+      </div>
+
+      <div id="ctrl4"></div>
+      <div id="cap4" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> kernel / program code</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> HBM tensor &amp; on-chip SRAM</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> tile load / store</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> compute on the tile</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>One kernel, many program instances (Triton) or thread blocks (CUDA/ROCm) — each handling a
+      different tile of the same tensor, all running at once across the SMs. The art of a fast kernel is
+      choosing a tile that fits in SRAM and registers so the cores stay busy instead of waiting on HBM.</p>
+    </div>
+
+    <!-- ================= FIGURE 5 — Roofline / arithmetic intensity (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Memory-bound vs compute-bound: why decode waits</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Arithmetic intensity = math done per byte moved. Low intensity work is starved by
+      bandwidth; high intensity work finally saturates the cores. This is the roofline intuition.</p>
+
+      <div class="stage">
+        <svg id="svg5" viewBox="0 0 920 380" role="img" aria-label="A roofline plot showing decode in the memory-bound region and prefill in the compute-bound region"></svg>
+      </div>
+
+      <div id="ctrl5"></div>
+      <div id="cap5" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> memory-bandwidth roof</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> peak-compute roof</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> decode (low intensity)</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> prefill / big matmul (high intensity)</span>
+      </div>
+    </section>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m09-training.html"><span class="dir">← Previous</span><span class="ttl">Appendix: Overview of Training</span></a>
+      <a class="next" href="m11-runtimes.html"><span class="dir">Next →</span><span class="ttl">Appendix: Inference Runtimes</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  // ===================================================================
+  // FIGURE 1 — GPU execution model: grid → blocks → SMs → warps (Stepper)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg1");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // Grid of 6 thread blocks (left); 3 SMs (right).
+    const blocks = [
+      {id:0, x:60,  y:96 }, {id:1, x:150, y:96 }, {id:2, x:60,  y:176},
+      {id:3, x:150, y:176}, {id:4, x:60,  y:256}, {id:5, x:150, y:256},
+    ];
+    const bw = 78, bh = 64;
+    const sms = [ {y:92}, {y:200}, {y:308} ];
+    const smX = 560, smW = 300, smH = 86;
+    // which block lands on which SM (round-robin over time)
+    const dispatch = [0,1,2,3,4,5];          // block id order
+    const smOf = [0,1,2,0,1,2];              // target SM per block
+
+    function frame(x,y,w,h,opts){
+      opts = opts||{};
+      svg.appendChild(S("path",{d:IOP.rr(x,y,w,h,opts.r||9),
+        fill:opts.fill||"none", stroke:opts.stroke||C.border,
+        "stroke-width":opts.sw||1.5, opacity:opts.opacity??1}));
+    }
+    function label(x,y,t,cls){ svg.appendChild(S("text",{x,y,class:cls||"svg-label",text:t})); }
+
+    function drawBlock(b, opts){
+      opts = opts||{};
+      frame(b.x,b.y,bw,bh,{fill:opts.fill||"rgba(167,139,250,.10)",
+        stroke:opts.stroke||C.weight, sw:opts.sw||1.6, opacity:opts.opacity??1});
+      // little thread dots inside (a block = several warps of threads)
+      for(let i=0;i<12;i++){
+        const cx = b.x+12+(i%4)*18, cy = b.y+16+Math.floor(i/4)*16;
+        svg.appendChild(S("circle",{cx,cy,r:3.1,
+          fill:opts.dotFill||C.weight, opacity:(opts.opacity??1)*0.8}));
+      }
+      label(b.x+4,b.y-6,"block "+b.id,"svg-faint");
+    }
+
+    function drawSM(i, active, warpP){
+      const y = sms[i].y;
+      frame(smX,y,smW,smH,{fill:active?"rgba(52,211,153,.07)":"rgba(255,255,255,.02)",
+        stroke:active?C.compute:C.border, sw:active?2:1.4});
+      label(smX+12,y+18,"SM "+i,"svg-title");
+      label(smX+12,y+34,"cores · registers · L1 · warp scheduler","svg-faint");
+      // a row of warp "lanes": 4 warps × 8 cores each, lit progressively
+      const lanes = 4, perLane = 8;
+      for(let w=0; w<lanes; w++){
+        const lit = active && warpP*lanes > w;        // warps go SIMT one wave at a time
+        for(let k=0;k<perLane;k++){
+          const cx = smX+150+k*17, cy = y+22+w*15;
+          const on = lit;
+          svg.appendChild(S("rect",{x:cx-6,y:cy-5,width:12,height:10,rx:2.5,
+            fill: on?C.compute:"#1b2740",
+            stroke: on?C.compute:C.borderSoft, "stroke-width":1,
+            opacity: on?(0.55+0.45*Math.min(1,(warpP*lanes-w))):0.5}));
+        }
+        if(active) label(smX+150-44,y+26+w*15,"warp "+w,"svg-faint");
+      }
+    }
+
+    function render(step, p){
+      clear(svg);
+      label(40,40,"KERNEL LAUNCH","svg-title");
+      label(40,58,"a grid of thread blocks","svg-label");
+      label(smX,40,"HARDWARE: STREAMING MULTIPROCESSORS","svg-title");
+
+      // Always draw the 3 SMs; activity depends on step.
+      // Determine, for the current step, which blocks have been dispatched.
+      let dispatchedUpTo = 0;        // count of blocks already on an SM
+      let movingBlock = -1;          // a block currently flying
+      let warpProg = 0;              // warp execution progress on active SMs
+      const smActive = [false,false,false];
+
+      if(step === 0){
+        // grid sits, no dispatch yet
+        dispatchedUpTo = 0;
+      } else if(step === 1){
+        // first wave: blocks 0,1,2 dispatch to SM 0,1,2 ; show one in flight
+        dispatchedUpTo = Math.floor(lerp(0,3,p));
+        movingBlock = (p<0.95)? Math.min(2, dispatchedUpTo) : -1;
+        for(let i=0;i<dispatchedUpTo;i++) smActive[smOf[i]] = true;
+      } else if(step === 2){
+        // all SMs busy, warps executing in lockstep
+        dispatchedUpTo = 3;
+        smActive[0]=smActive[1]=smActive[2]=true;
+        warpProg = ease(p);
+      } else {
+        // step 3: branch divergence on SM 1
+        dispatchedUpTo = 3;
+        smActive[0]=smActive[1]=smActive[2]=true;
+        warpProg = 1;
+      }
+
+      // Draw remaining blocks in the grid (not yet dispatched)
+      blocks.forEach((b,i)=>{
+        const idx = dispatch.indexOf(b.id);
+        const gone = idx < dispatchedUpTo && i!==movingBlock;
+        if(!gone){
+          const fade = (i===movingBlock)? 0.25 : 1;
+          drawBlock(b,{opacity:fade});
+        }
+      });
+
+      // Draw the SMs
+      for(let i=0;i<3;i++) drawSM(i, smActive[i], warpProg);
+
+      // Show resident blocks parked at their SM (a small violet tab)
+      for(let i=0;i<dispatchedUpTo;i++){
+        const ty = sms[smOf[i]].y;
+        svg.appendChild(S("path",{d:IOP.rr(smX-2,ty+58,46,20,5),
+          fill:"rgba(167,139,250,.18)",stroke:C.weight,"stroke-width":1.2}));
+        svg.appendChild(S("text",{x:smX+4,y:ty+72,class:"svg-faint",text:"blk "+i}));
+      }
+
+      // The flying block (dispatch arrow + ghost)
+      if(movingBlock>=0){
+        const b = blocks[movingBlock];
+        const tx = smX+10, ty = sms[smOf[movingBlock]].y+10;
+        const cx = lerp(b.x+bw, tx, ease(p));
+        const cy = lerp(b.y, ty, ease(p));
+        svg.appendChild(S("path",{d:IOP.rr(cx,cy,bw,bh,9),
+          fill:"rgba(56,189,248,.14)",stroke:C.accent,"stroke-width":1.8}));
+        // dashed dispatch path
+        svg.appendChild(S("line",{x1:b.x+bw,y1:b.y+bh/2,x2:tx,y2:ty+bh/2,
+          stroke:C.accent,"stroke-width":1.6,"stroke-dasharray":"5 5",opacity:.6}));
+        label(cx+8,cy-6,"dispatch →","svg-faint");
+      }
+
+      // Branch-divergence callout on step 3 (SM 1, warp 1)
+      if(step === 3){
+        const y = sms[1].y;
+        // mark 3 of the 8 lanes in warp 1 as the "other path" (idle / red)
+        for(let k=4;k<8;k++){
+          const cx = smX+150+k*17, cy = y+22+1*15;
+          svg.appendChild(S("rect",{x:cx-6,y:cy-5,width:12,height:10,rx:2.5,
+            fill:"#241620",stroke:C.warn,"stroke-width":1.2,opacity:.9}));
+        }
+        svg.appendChild(S("path",{d:IOP.rr(smX+150+4*17-8,y+22+1*15-9,4*17+4,18,5),
+          fill:"none",stroke:C.warn,"stroke-width":1.6,"stroke-dasharray":"4 3"}));
+        label(smX+150,y+58,"branch divergence: paths serialize, lanes idle","svg-faint");
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption:  document.getElementById("cap1"),
+      captions: [
+        "<b>Step 1 — the grid.</b> A <span class='k'>kernel</span> launch produces a <span class='k'>grid</span> of <b>thread blocks</b> (CTAs). Each block is a bundle of threads that will run together; nothing is on the hardware yet.",
+        "<b>Step 2 — dispatch.</b> The hardware schedules whole <b>thread blocks</b> onto <span class='k'>Streaming Multiprocessors (SMs)</span>. All threads of a block are guaranteed to land on the <b>same SM</b> at the same time so they can share memory and synchronize.",
+        "<b>Step 3 — warps in SIMT.</b> Inside each SM, threads are grouped into <span class='k'>warps</span> of <b>32 threads</b> that execute the same instruction in <b>lockstep</b> on different data. The SM's <b>warp scheduler</b> juggles many warps so it can hide memory stalls.",
+        "<b>Step 4 — branch divergence.</b> If threads in a warp take <b>different branches</b>, the paths run <span class='k'>sequentially</span> with the off-path lanes idling. This <b>divergence</b> wastes lanes and is the main SIMT performance pitfall.",
+      ],
+      render,
+      dwell: 2200,
+      autoplay: false,
+    });
+  })();
+
+  // ===================================================================
+  // FIGURE 2 — Throughput vs latency: few big CPU cores vs many GPU cores (Loop)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg2");
+    const { S, C, clear } = IOP;
+
+    const cpuCores = 4, cpuX = 70, cpuW = 150, cpuGapY = 60, cpuY0 = 78, cpuItemMs = 1.05;
+    // GPU grid of small cores
+    const gCols = 16, gRows = 6, gX = 470, gY = 70, gCellW = 26, gCellH = 30;
+
+    function render(t){
+      clear(svg);
+
+      // ---- titles ----
+      svg.appendChild(S("text",{x:40,y:40,class:"svg-title",text:"CPU — few big cores"}));
+      svg.appendChild(S("text",{x:40,y:58,class:"svg-label",text:"latency-optimized · finishes each item fast"}));
+      svg.appendChild(S("text",{x:gX,y:40,class:"svg-title",text:"GPU — many small cores"}));
+      svg.appendChild(S("text",{x:gX,y:58,class:"svg-label",text:"throughput-optimized · floods the grid"}));
+
+      // ---- CPU side: 4 big cores, each cycling through items slowly ----
+      for(let c=0;c<cpuCores;c++){
+        const y = cpuY0 + c*cpuGapY;
+        svg.appendChild(S("path",{d:IOP.rr(cpuX,y,cpuW,44,10),
+          fill:"rgba(96,165,250,.10)",stroke:C.mem,"stroke-width":1.8}));
+        svg.appendChild(S("text",{x:cpuX+10,y:y+27,class:"svg-label",text:"core "+c}));
+        // progress bar of the current item
+        const phase = ((t*1.0 + c*0.37) % cpuItemMs)/cpuItemMs;
+        const bw = (cpuW-78)*phase;
+        svg.appendChild(S("rect",{x:cpuX+62,y:y+15,width:cpuW-78,height:14,rx:5,
+          fill:"#1b2740",stroke:C.borderSoft,"stroke-width":1}));
+        svg.appendChild(S("rect",{x:cpuX+62,y:y+15,width:bw,height:14,rx:5,fill:C.accent,opacity:.9}));
+      }
+      // throughput tally for CPU (slow)
+      const cpuDone = Math.floor(t*1.0*cpuCores);
+      svg.appendChild(S("text",{x:cpuX,y:cpuY0+cpuCores*cpuGapY+6,class:"svg-faint",
+        text:"≈ "+cpuDone+" items done"}));
+
+      // ---- GPU side: grid of small cores, many lit at once, fast wave ----
+      let lit = 0;
+      for(let r=0;r<gRows;r++){
+        for(let cc=0;cc<gCols;cc++){
+          const x = gX + cc*gCellW, y = gY + r*gCellH;
+          // each cell pulses on a fast staggered schedule
+          const ph = (t*2.4 + (r*gCols+cc)*0.11) % 1;
+          const on = ph < 0.7;
+          if(on) lit++;
+          svg.appendChild(S("rect",{x:x,y:y,width:gCellW-6,height:gCellH-7,rx:4,
+            fill: on? C.compute : "#16202f",
+            stroke: on? C.compute : C.borderSoft, "stroke-width":1,
+            opacity: on? (0.55+0.45*(1-ph/0.7)) : 0.55}));
+        }
+      }
+      // throughput tally for GPU (fast, big)
+      const gpuDone = Math.floor(t*2.4*gCols*gRows*0.7);
+      svg.appendChild(S("text",{x:gX,y:gY+gRows*gCellH+18,class:"svg-faint",
+        text:"≈ "+gpuDone+" items done · "+lit+" cores busy now"}));
+
+      // divider
+      svg.appendChild(S("line",{x1:430,y1:70,x2:430,y2:280,stroke:C.border,"stroke-width":1.3,"stroke-dasharray":"3 5"}));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl2"), render, autoplay: true, speed: 1 });
+  })();
+
+  // ===================================================================
+  // FIGURE 3 — Memory hierarchy (Stepper)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg3");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // levels: width encodes capacity (grows downward); label gives speed
+    const levels = [
+      {key:"reg",  name:"Register file",        sub:"per-thread · on SM",          cap:"~KB / SM",   speed:"fastest",      w:160, color:C.compute, scope:"thread"},
+      {key:"l1",   name:"Shared memory / L1",   sub:"per-block · on-chip SRAM",    cap:"~100s KB",   speed:"~10× slower",  w:300, color:C.mem,     scope:"block"},
+      {key:"l2",   name:"L2 cache",             sub:"shared by all SMs",           cap:"~tens MB",   speed:"~100× slower", w:480, color:C.mem,     scope:"chip"},
+      {key:"hbm",  name:"HBM / global (DRAM)",  sub:"VRAM · weights + KV cache",   cap:"tens–100s GB", speed:"slowest, but huge", w:760, color:C.kv,   scope:"device"},
+    ];
+    const topY = 86, rowH = 58, gap = 16, cx = 460;
+
+    function rowY(i){ return topY + i*(rowH+gap); }
+
+    function drawLevel(i, hot, dim){
+      const L = levels[i];
+      const y = rowY(i);
+      const x = cx - L.w/2;
+      svg.appendChild(S("path",{d:IOP.rr(x,y,L.w,rowH,11),
+        fill: hot? "rgba(96,165,250,.16)" : "rgba(255,255,255,.025)",
+        stroke: hot? L.color : C.border, "stroke-width": hot?2.2:1.5,
+        opacity: dim?0.4:1}));
+      svg.appendChild(S("text",{x:x+16,y:y+24,class:"svg-title",text:L.name,opacity:dim?0.5:1}));
+      svg.appendChild(S("text",{x:x+16,y:y+42,class:"svg-faint",text:L.sub,opacity:dim?0.5:1}));
+      // capacity (right) + speed pill
+      svg.appendChild(S("text",{x:x+L.w-14,y:y+24,class:"svg-label","text-anchor":"end",text:L.cap,opacity:dim?0.5:1}));
+      svg.appendChild(S("text",{x:x+L.w-14,y:y+42,class:"svg-faint","text-anchor":"end",text:L.speed,opacity:dim?0.5:1}));
+    }
+
+    function render(step, p){
+      clear(svg);
+      // header arrows describing the two axes
+      svg.appendChild(S("text",{x:40,y:40,class:"svg-title",text:"MEMORY HIERARCHY"}));
+      svg.appendChild(S("text",{x:40,y:58,class:"svg-label",text:"down ↓ : capacity grows, bandwidth & latency get worse"}));
+
+      // capacity arrow (left margin)
+      svg.appendChild(S("line",{x1:24,y1:topY,x2:24,y2:rowY(3)+rowH,stroke:C.faint,"stroke-width":1.4,"marker":""}));
+      svg.appendChild(S("text",{x:18,y:topY-4,class:"svg-faint",text:"small"}));
+      svg.appendChild(S("text",{x:14,y:rowY(3)+rowH+14,class:"svg-faint",text:"large"}));
+
+      // which level is highlighted this step (0..3 walk down; step 4 = whole hierarchy)
+      const hotIdx = (step<=3)? step : -1;
+
+      for(let i=0;i<4;i++){
+        const hot = (i===hotIdx) || (step===4 && i===3);
+        drawLevel(i, hot, false);
+      }
+
+      // a thread/SM marker on the left that "reaches" the active level
+      if(step<=3){
+        const y = rowY(step)+rowH/2;
+        const mx = cx - levels[step].w/2 - 34;
+        svg.appendChild(S("circle",{cx:mx, cy:y, r:11, fill:C.compute, opacity:0.9}));
+        svg.appendChild(S("text",{x:mx, y:y+4, "text-anchor":"middle", class:"svg-faint", text:"T"}));
+        // animated data packet traveling from the level to the thread
+        const px = lerp(cx - levels[step].w/2, mx+14, ease(p));
+        svg.appendChild(S("rect",{x:px-7,y:y-7,width:14,height:14,rx:3,fill:C.accent,opacity:0.95}));
+        svg.appendChild(S("line",{x1:cx-levels[step].w/2,y1:y,x2:mx+12,y2:y,
+          stroke:C.accent,"stroke-width":1.4,"stroke-dasharray":"4 4",opacity:.55}));
+      }
+
+      // step 4: highlight HBM holding weights+KV and the bandwidth-bound message
+      if(step===4){
+        const L = levels[3], y = rowY(3);
+        const x = cx - L.w/2;
+        // little chips for weights + KV inside HBM
+        svg.appendChild(S("path",{d:IOP.rr(x+150,y+12,120,34,7),fill:"rgba(167,139,250,.18)",stroke:C.weight,"stroke-width":1.3}));
+        svg.appendChild(S("text",{x:x+210,y:y+33,"text-anchor":"middle",class:"svg-faint",text:"model weights"}));
+        svg.appendChild(S("path",{d:IOP.rr(x+290,y+12,120,34,7),fill:"rgba(251,191,36,.18)",stroke:C.kv,"stroke-width":1.3}));
+        svg.appendChild(S("text",{x:x+350,y:y+33,"text-anchor":"middle",class:"svg-faint",text:"KV cache"}));
+        // arrow up showing every token must stream these from HBM
+        const ax = x+L.w/2;
+        for(let k=0;k<5;k++){
+          const yy = rowY(3) - (ease(IOP.clamp(p*1.3 - k*0.12,0,1)))*40 - 4;
+          svg.appendChild(S("rect",{x:ax-5,y:yy-5,width:10,height:10,rx:2,fill:C.attn,opacity:0.85}));
+        }
+        svg.appendChild(S("text",{x:ax+14,y:rowY(3)-18,class:"svg-faint",text:"decode reads all of HBM per step → bandwidth-bound"}));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl3"),
+      caption:  document.getElementById("cap3"),
+      captions: [
+        "<b>Registers — fastest.</b> The <span class='k'>register file</span> lives on the SM and is partitioned to threads. Cores read and write it <b>without blocking</b>; it is tiny (kilobytes) but as fast as memory gets.",
+        "<b>Shared memory / L1 — on-chip SRAM.</b> Built from low-latency <span class='k'>SRAM</span>, private to each SM, and about <b>10× slower</b> than registers. It is a hybrid: a software-managed scratchpad (<b>Shared Memory</b>) plus a hardware-managed cache.",
+        "<b>L2 — shared cache.</b> A hardware-managed <span class='k'>L2 cache</span> shared by <b>all SMs</b>, roughly another order of magnitude slower and a few orders of magnitude larger than L1.",
+        "<b>HBM / global — large but slow.</b> The GPU's main memory (<span class='k'>DRAM / VRAM</span>, usually <b>HBM</b>) is huge but the slowest tier. Its size sets the model size, concurrency, and context length you can run.",
+        "<b>Why inference is bandwidth-bound.</b> Model <span class='k'>weights</span> and the <span class='k'>KV cache</span> live in HBM, and each decode step must stream them through. With little math per byte, the cores wait on memory — this is why <b>FlashAttention keeps tiles in SRAM</b> (Module 5).",
+      ],
+      render,
+      dwell: 2300,
+      autoplay: false,
+    });
+  })();
+
+  // ===================================================================
+  // FIGURE 4 — Kernels & Triton: one program instance, one tile (Stepper)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg4");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // HBM matrix (grid of tiles) on the left, SRAM scratchpad on the right.
+    const cols=4, rows=4, tile=44, gx=70, gy=90;
+    const sramX=560, sramY=110, sramW=150, sramH=150;
+    const target = {r:1, c:1};   // the tile this program instance owns
+
+    function matrix(highlight, loadedAway){
+      // outer frame
+      svg.appendChild(S("path",{d:IOP.rr(gx-14,gy-14,cols*tile+28,rows*tile+28,12),
+        fill:"rgba(96,165,250,.06)",stroke:C.mem,"stroke-width":1.6}));
+      svg.appendChild(S("text",{x:gx-14,y:gy-22,class:"svg-label",text:"input tensor in HBM (global memory)"}));
+      for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+        const isT = (r===target.r&&c===target.c);
+        const x=gx+c*tile, y=gy+r*tile;
+        const hide = isT && loadedAway;
+        svg.appendChild(S("rect",{x:x+3,y:y+3,width:tile-6,height:tile-6,rx:5,
+          fill: isT? (hide?"#16202f":"rgba(56,189,248,.20)") : "rgba(96,165,250,.10)",
+          stroke: isT? C.accent : C.borderSoft,
+          "stroke-width": isT?2:1, opacity: hide?0.45:1}));
+      }
+    }
+
+    function sram(state, p){
+      // state: 'empty' | 'loading' | 'compute' | 'done'
+      svg.appendChild(S("path",{d:IOP.rr(sramX,sramY,sramW,sramH,12),
+        fill:"rgba(96,165,250,.05)",stroke:C.mem,"stroke-width":1.8}));
+      svg.appendChild(S("text",{x:sramX,y:sramY-10,class:"svg-label",text:"on-chip SRAM (shared memory)"}));
+      const cx=sramX+sramW/2, cy=sramY+sramH/2;
+      if(state==='loading'){
+        // tile flies in
+        const sx=gx+target.c*tile+tile/2, sy=gy+target.r*tile+tile/2;
+        const px=lerp(sx,cx,ease(p)), py=lerp(sy,cy,ease(p));
+        svg.appendChild(S("line",{x1:sx,y1:sy,x2:cx,y2:cy,stroke:C.accent,"stroke-width":1.6,"stroke-dasharray":"5 5",opacity:.6}));
+        svg.appendChild(S("rect",{x:px-19,y:py-19,width:38,height:38,rx:6,fill:"rgba(56,189,248,.25)",stroke:C.accent,"stroke-width":2}));
+      } else if(state==='compute'){
+        svg.appendChild(S("rect",{x:cx-19,y:cy-19,width:38,height:38,rx:6,fill:"rgba(52,211,153,.22)",stroke:C.compute,"stroke-width":2}));
+        // pulsing "compute" ring
+        const rr = 22 + 8*Math.abs(Math.sin(p*Math.PI*3));
+        svg.appendChild(S("circle",{cx,cy,r:rr,fill:"none",stroke:C.compute,"stroke-width":1.6,opacity:.7}));
+        svg.appendChild(S("text",{x:cx,y:cy+5,"text-anchor":"middle",class:"svg-faint",text:"compute"}));
+      } else if(state==='done'){
+        svg.appendChild(S("rect",{x:cx-19,y:cy-19,width:38,height:38,rx:6,fill:"rgba(52,211,153,.22)",stroke:C.compute,"stroke-width":2}));
+        svg.appendChild(S("text",{x:cx,y:cy+5,"text-anchor":"middle",class:"svg-faint",text:"result"}));
+      } else {
+        svg.appendChild(S("text",{x:cx,y:cy+5,"text-anchor":"middle",class:"svg-faint",text:"empty"}));
+      }
+    }
+
+    function codeCard(){
+      // little kernel/program card at top
+      svg.appendChild(S("path",{d:IOP.rr(360,28,360,40,9),fill:"rgba(167,139,250,.10)",stroke:C.weight,"stroke-width":1.5}));
+      svg.appendChild(S("text",{x:374,y:46,class:"svg-label",text:"@triton.jit  def kernel(...):"}));
+      svg.appendChild(S("text",{x:374,y:62,class:"svg-faint",text:"pid = program_id() → this instance owns ONE tile"}));
+    }
+
+    function render(step, p){
+      clear(svg);
+      svg.appendChild(S("text",{x:40,y:40,class:"svg-title",text:"A KERNEL, TILED"}));
+      svg.appendChild(S("text",{x:40,y:58,class:"svg-faint",text:"CUDA / ROCm native · Triton = tiled kernels in Python"}));
+      codeCard();
+
+      if(step===0){
+        matrix(true,false);
+        sram('empty',p);
+      } else if(step===1){
+        matrix(true,true);
+        sram('loading',p);
+      } else if(step===2){
+        matrix(true,true);
+        sram('compute',p);
+      } else {
+        matrix(true,true);
+        sram('done',1);
+        // write result back to HBM (an output position)
+        const sx=sramX+sramW/2, sy=sramY+sramH/2;
+        const tx=gx+target.c*tile+tile/2, ty=gy+target.r*tile+tile/2;
+        const px=lerp(sx,tx,ease(p)), py=lerp(sy,ty,ease(p));
+        svg.appendChild(S("line",{x1:sx,y1:sy,x2:tx,y2:ty,stroke:C.accent,"stroke-width":1.6,"stroke-dasharray":"5 5",opacity:.6}));
+        svg.appendChild(S("rect",{x:px-15,y:py-15,width:30,height:30,rx:5,fill:"rgba(52,211,153,.30)",stroke:C.compute,"stroke-width":2}));
+        // overwrite the home tile with the result
+        if(p>0.9){
+          const x=gx+target.c*tile, y=gy+target.r*tile;
+          svg.appendChild(S("rect",{x:x+3,y:y+3,width:tile-6,height:tile-6,rx:5,fill:"rgba(52,211,153,.22)",stroke:C.compute,"stroke-width":2}));
+        }
+      }
+
+      // footer note: many instances cover the whole tensor
+      svg.appendChild(S("text",{x:40,y:362,class:"svg-faint",
+        text:"× one program instance per tile — the whole grid runs across the SMs at once"}));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl4"),
+      caption:  document.getElementById("cap4"),
+      captions: [
+        "<b>A kernel + its tiles.</b> A <span class='k'>kernel</span> is one function run across the whole grid. With <b>Triton</b>, each <b>program instance</b> uses its id to claim <b>one tile</b> of the tensor sitting in HBM.",
+        "<b>Load the tile to SRAM.</b> The instance explicitly streams its tile from slow <span class='k'>HBM</span> into fast on-chip <span class='k'>SRAM</span> (shared memory) — paying the global-memory cost <b>once</b>.",
+        "<b>Compute on-chip.</b> All the math runs against the tile in <span class='k'>SRAM</span>, where the cores never stall on global memory. This is the tiling pattern at the heart of fast matmul and attention kernels.",
+        "<b>Write back.</b> The instance stores its result tile back to <span class='k'>HBM</span>. Triton compiles this same Python down to <b>CUDA</b> (NVIDIA) or <b>ROCm</b> (AMD) — hardware-agnostic, one source.",
+      ],
+      render,
+      dwell: 2200,
+      autoplay: false,
+    });
+  })();
+
+  // ===================================================================
+  // FIGURE 5 — Roofline: memory-bound vs compute-bound (Stepper)
+  // ===================================================================
+  (function () {
+    const svg = document.getElementById("svg5");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // plot area
+    const px0=90, py0=300, px1=860, py1=70;     // x-axis bottom, y-axis top
+    const knee = 360;                            // x of the roofline knee (ridge point)
+    const roofY = 110;                           // y of the flat compute roof
+
+    function axes(){
+      // axes
+      svg.appendChild(S("line",{x1:px0,y1:py0,x2:px1,y2:py0,stroke:C.border,"stroke-width":1.6}));
+      svg.appendChild(S("line",{x1:px0,y1:py0,x2:px0,y2:py1,stroke:C.border,"stroke-width":1.6}));
+      svg.appendChild(S("text",{x:(px0+px1)/2,y:py0+34,"text-anchor":"middle",class:"svg-label",text:"arithmetic intensity  →  (FLOPs per byte moved)"}));
+      // rotated y label
+      const yl = S("text",{x:0,y:0,class:"svg-label",text:"attainable performance (FLOP/s)","text-anchor":"middle"});
+      yl.setAttribute("transform",`translate(34,${(py0+py1)/2}) rotate(-90)`);
+      svg.appendChild(yl);
+    }
+
+    function roofline(reveal){
+      // sloped memory-bandwidth roof from (px0,py0) up to the knee, then flat compute roof
+      const kx = knee, ky = roofY;
+      // memory-bound slope (reveal 0..1 draws left→knee)
+      const sx = lerp(px0, kx, IOP.clamp(reveal*2,0,1));
+      const sy = lerp(py0, ky, IOP.clamp(reveal*2,0,1));
+      svg.appendChild(S("line",{x1:px0,y1:py0,x2:sx,y2:sy,stroke:C.warn,"stroke-width":3}));
+      if(reveal>0.5){
+        const fx = lerp(kx, px1, IOP.clamp((reveal-0.5)*2,0,1));
+        svg.appendChild(S("line",{x1:kx,y1:ky,x2:fx,y2:ky,stroke:C.compute,"stroke-width":3}));
+      }
+      // labels for the two roofs
+      svg.appendChild(S("text",{x:px0+96,y:py0-96,class:"svg-faint",text:"slope = memory bandwidth",fill:C.warn}));
+      if(reveal>0.6) svg.appendChild(S("text",{x:kx+70,y:ky-10,class:"svg-faint",text:"flat = peak compute",fill:C.compute}));
+      // ridge point marker
+      if(reveal>0.5){
+        svg.appendChild(S("circle",{cx:kx,cy:ky,r:4,fill:C.muted}));
+        svg.appendChild(S("text",{x:kx-6,y:ky-12,"text-anchor":"end",class:"svg-faint",text:"ridge point"}));
+      }
+    }
+
+    // a workload dot sits at its intensity x, capped by the roofline
+    function roofAt(x){
+      if(x<=knee){ return lerp(py0, roofY, (x-px0)/(knee-px0)); }
+      return roofY;
+    }
+    function dot(x,label,color,sub){
+      const y = roofAt(x);
+      svg.appendChild(S("line",{x1:x,y1:py0,x2:x,y2:y,stroke:color,"stroke-width":1.2,"stroke-dasharray":"3 4",opacity:.5}));
+      svg.appendChild(S("circle",{cx:x,cy:y,r:8,fill:color,opacity:.95}));
+      svg.appendChild(S("text",{x:x,y:y-14,"text-anchor":"middle",class:"svg-title",text:label,fill:color}));
+      if(sub) svg.appendChild(S("text",{x:x,y:py0+18,"text-anchor":"middle",class:"svg-faint",text:sub}));
+    }
+
+    const decodeX = px0 + 70;     // low intensity (left of knee → memory-bound)
+    const prefillX = knee + 230;  // high intensity (right of knee → compute-bound)
+
+    function render(step, p){
+      clear(svg);
+      svg.appendChild(S("text",{x:40,y:40,class:"svg-title",text:"ROOFLINE INTUITION"}));
+      svg.appendChild(S("text",{x:40,y:56,class:"svg-faint",text:"where a workload lives depends on math-per-byte"}));
+      axes();
+
+      if(step===0){
+        roofline(0.0);
+        svg.appendChild(S("text",{x:(px0+px1)/2,y:(py0+roofY)/2,"text-anchor":"middle",class:"svg-faint",text:"two ceilings limit any kernel"}));
+      } else if(step===1){
+        roofline(ease(p));
+      } else if(step===2){
+        roofline(1);
+        // shade memory-bound region
+        svg.appendChild(S("path",{d:IOP.rr(px0,roofY,knee-px0,py0-roofY,0),fill:"rgba(248,113,113,.07)"}));
+        dot(decodeX,"decode",C.kv,"low intensity · ~1 token, big weight read");
+        svg.appendChild(S("text",{x:px0+18,y:py0-8,class:"svg-faint",text:"MEMORY-BOUND",fill:C.warn}));
+      } else if(step===3){
+        roofline(1);
+        svg.appendChild(S("path",{d:IOP.rr(knee,roofY,px1-knee,py0-roofY,0),fill:"rgba(52,211,153,.06)"}));
+        dot(prefillX,"prefill",C.accent,"high intensity · big batched matmul");
+        svg.appendChild(S("text",{x:knee+200,y:py0-8,class:"svg-faint",text:"COMPUTE-BOUND",fill:C.compute}));
+      } else {
+        roofline(1);
+        svg.appendChild(S("path",{d:IOP.rr(px0,roofY,knee-px0,py0-roofY,0),fill:"rgba(248,113,113,.07)"}));
+        svg.appendChild(S("path",{d:IOP.rr(knee,roofY,px1-knee,py0-roofY,0),fill:"rgba(52,211,153,.06)"}));
+        dot(decodeX,"decode",C.kv,"bandwidth-bound");
+        dot(prefillX,"prefill",C.accent,"compute-bound");
+        svg.appendChild(S("text",{x:px0+18,y:py0-8,class:"svg-faint",text:"MEMORY-BOUND",fill:C.warn}));
+        svg.appendChild(S("text",{x:knee+200,y:py0-8,class:"svg-faint",text:"COMPUTE-BOUND",fill:C.compute}));
+        // arrow nudging decode toward the ridge (batching raises intensity)
+        const ax=decodeX+16, ay=roofAt(decodeX)+2;
+        svg.appendChild(S("line",{x1:ax,y1:ay,x2:ax+70,y2:roofAt(decodeX+86),stroke:C.muted,"stroke-width":1.4,"stroke-dasharray":"4 4"}));
+        svg.appendChild(S("text",{x:ax+8,y:ay+22,class:"svg-faint",text:"batching → more math per byte → toward the ridge"}));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl5"),
+      caption:  document.getElementById("cap5"),
+      captions: [
+        "<b>Two ceilings.</b> Every kernel is capped by either <span class='k'>memory bandwidth</span> or <span class='k'>peak compute</span>. The <b>roofline</b> plots the best you can do versus <b>arithmetic intensity</b> — FLOPs per byte moved.",
+        "<b>The roof.</b> At low intensity the limit is a <span class='k'>bandwidth slope</span> (left); past the <b>ridge point</b> it flattens into the <span class='k'>compute roof</span> (right). Where the two meet is the break-even intensity.",
+        "<b>Decode is memory-bound.</b> Generating one token does little math but must read all the <b>weights</b> (and KV) from HBM — very <span class='k'>low intensity</span>, pinned under the bandwidth slope. The cores idle waiting on memory.",
+        "<b>Prefill is compute-bound.</b> Processing the prompt is one big batched <b>matmul</b> — lots of FLOPs reusing the same loaded bytes — so it lands in the <span class='k'>high-intensity</span> region and finally saturates the cores.",
+        "<b>The lever.</b> Most inference work sits on the memory roof, which is why bandwidth dominates. <span class='k'>Batching</span> raises math-per-byte and pushes decode rightward toward the ridge — the recurring theme of this whole series.",
+      ],
+      render,
+      dwell: 2400,
+      autoplay: false,
+    });
+  })();
+  </script>
+</body>
+</html>

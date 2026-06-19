@@ -1,0 +1,629 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE 3 / 11 — Sharding a Model
+     Pipeline · Tensor · Expert parallelism
+     Self-contained: only shared.css + shared.js. Vanilla JS + inline SVG.
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sharding a Model — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;3 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/modelsharding/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 3 · Scaling across GPUs</div>
+      <h1>Sharding a Model</h1>
+      <p class="lead">Models and context windows have outgrown the memory of any single GPU, so a large model
+      must be split across many. Three strategies — <b>pipeline</b>, <b>tensor</b>, and <b>expert</b>
+      parallelism — split the model in different ways and pay for it with different communication patterns.</p>
+    </header>
+
+    <div class="prose">
+      <p>The unit of splitting differs in each strategy. <b>Pipeline parallelism</b> puts whole
+      <i>layers</i> on different GPUs. <b>Tensor parallelism</b> splits a single matrix multiply
+      <i>within</i> a layer across GPUs. <b>Expert parallelism</b> places different MoE
+      <i>experts</i> on different GPUs. The interconnect available — fast <code>NVLink</code> inside a
+      node (~1&nbsp;TB/s) vs. a slower network between nodes — heavily shapes which strategy you reach for.</p>
+    </div>
+
+    <!-- ================= FIGURE 1 — Pipeline parallelism (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Pipeline parallelism — layers split across GPUs, and the bubble</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Each GPU holds a contiguous slice of layers. Microbatches flow stage→stage; watch
+      the idle <b>pipeline bubble</b> shrink as more microbatches keep every GPU busy.</p>
+
+      <div class="stage">
+        <svg id="svgA" viewBox="0 0 920 380" role="img" aria-label="Pipeline parallelism schedule showing microbatches flowing through GPU stages with idle bubbles during fill and drain"></svg>
+      </div>
+
+      <div id="ctrlA"></div>
+      <div id="capA" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> model layers</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> GPU computing</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> idle / bubble</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> point-to-point handoff</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>A single request must traverse <i>every</i> GPU, and only one stage works on it at a time — so
+      pipelining adds latency and, on its own, leaves GPUs idle during fill and drain. The communication is
+      gentle though: each stage only forwards activations to the <b>one</b> next GPU
+      (<code>point-to-point</code>). That low communication-to-compute ratio is why pipeline parallelism is
+      favored <i>across nodes</i>, where the interconnect is slower.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Tensor parallelism (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Tensor parallelism — one matmul split across GPUs + AllReduce</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">A single big matrix multiply (an FFN or attention projection) is sharded by columns.
+      Each GPU computes a <b>partial</b> result on its weight shard, then an <b>AllReduce</b> combines the
+      partials so every GPU ends up with the full layer output. This happens inside <i>every</i> layer.</p>
+
+      <div class="stage">
+        <svg id="svgB" viewBox="0 0 920 400" role="img" aria-label="Tensor parallelism: input broadcast to all GPUs, each computes a partial output on its weight shard, then AllReduce combines into the full output"></svg>
+      </div>
+
+      <div id="ctrlB"></div>
+      <div id="capB" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> input activations</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> weight shard</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> partial compute</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> AllReduce traffic</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Tradeoff</span>
+      Tensor parallelism has a much <b>higher communication-to-compute ratio</b> than pipeline parallelism —
+      an AllReduce fires after a matmul in <i>every</i> layer. Inside a node with fast <code>NVLink</code>
+      that's worth it: every GPU works simultaneously, lowering request latency. It's also the
+      <i>only</i> option when even a single layer is too big to fit on one GPU.
+    </div>
+
+    <!-- ================= FIGURE 3 — Expert parallelism (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Expert parallelism — routing MoE tokens with all-to-all</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">In a Mixture-of-Experts layer the router picks the top-<code>k</code> experts per token.
+      Experts live on different GPUs, so an <b>all-to-all dispatch</b> ships each token to its expert's GPU;
+      the expert FFN runs; then a <b>combine</b> returns results home before layer norm proceeds.</p>
+      <div class="stage">
+        <svg id="svgC" viewBox="0 0 920 400" role="img" aria-label="Expert parallelism: a router sends tokens across GPUs to their assigned experts via all-to-all, experts compute, then results combine back"></svg>
+      </div>
+      <div id="ctrlC"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> expert (FFN)</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> expert computing</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> all-to-all dispatch / combine</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> stalled (load imbalance)</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Only the top-<code>k</code> experts fire per token, and an expert is either fully active or idle —
+      which makes one expert a tidy unit to place on one GPU. But because each token activates
+      <i>different</i> experts on <i>different</i> GPUs, dispatch is <b>cluster-wide</b> all-to-all traffic.
+      A single overloaded expert (a <b>load imbalance</b>) stalls the whole inference pass — everyone waits
+      for the slowest expert before combine.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — Side-by-side summary (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Three strategies, side by side — and combined</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">What each strategy splits, its communication pattern and cost — and how real
+      deployments stack them: tensor parallelism within a node, pipeline parallelism across nodes.</p>
+
+      <div class="stage">
+        <svg id="svgD" viewBox="0 0 920 380" role="img" aria-label="Comparison of pipeline, tensor, and expert parallelism by what they split and their communication cost, and how they combine"></svg>
+      </div>
+
+      <div id="ctrlD"></div>
+      <div id="capD" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> what is split</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> communication pattern</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> intra-node (NVLink)</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> inter-node (network)</span>
+      </div>
+    </section>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m02-kvcache.html"><span class="dir">← Previous</span><span class="ttl">Inference and the KV Cache</span></a>
+      <a class="next" href="m04-batching.html"><span class="dir">Next →</span><span class="ttl">Batching, Scheduling, and Paging</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  "use strict";
+
+  /* small shared drawing helpers */
+  function gpuBox(svg, x, y, w, h, label, opts) {
+    opts = opts || {};
+    const { S, C } = IOP;
+    svg.appendChild(S("rect", { x, y, width: w, height: h, rx: 12,
+      fill: opts.fill || "#0c1422", stroke: opts.stroke || C.border,
+      "stroke-width": opts.sw || 1.5, opacity: opts.opacity ?? 1 }));
+    if (label) svg.appendChild(S("text", { x: x + 10, y: y + 18, class: "svg-label",
+      fill: opts.labelFill || C.muted, text: label }));
+  }
+  function arrow(svg, x1, y1, x2, y2, color, opts) {
+    opts = opts || {};
+    const { S } = IOP;
+    svg.appendChild(S("line", { x1, y1, x2, y2, stroke: color,
+      "stroke-width": opts.w || 2.5, "stroke-linecap": "round",
+      "stroke-dasharray": opts.dash || null, opacity: opts.opacity ?? 1 }));
+    // simple arrowhead
+    const ang = Math.atan2(y2 - y1, x2 - x1), a = 8;
+    svg.appendChild(S("path", {
+      d: `M${x2},${y2} L${x2 - a*Math.cos(ang - 0.5)},${y2 - a*Math.sin(ang - 0.5)} `
+       + `L${x2 - a*Math.cos(ang + 0.5)},${y2 - a*Math.sin(ang + 0.5)} Z`,
+      fill: color, opacity: opts.opacity ?? 1 }));
+  }
+
+  // ===================== FIGURE 1 — Pipeline parallelism (Stepper) =====================
+  (function () {
+    const svg = document.getElementById("svgA");
+    const { S, C, clear, ease } = IOP;
+    const NG = 4;                          // 4 GPU stages
+    const rowH = 56, rowGap = 12, topY = 56, leftX = 150;
+    const cellW = 58, cellGap = 6;
+    const layerNames = ["layers 1–8", "layers 9–16", "layers 17–24", "layers 25–32"];
+
+    // schedules per step: number of microbatches threaded through the pipeline
+    const SCHED = [1, 1, 3, 6];
+
+    function diag(stage, mb) { return mb + stage; } // time-slot a microbatch occupies at a stage
+
+    function render(step, p) {
+      clear(svg);
+      const NM = SCHED[step];
+      const totalSlots = NM + NG - 1;
+      const usableW = 920 - leftX - 40;
+      const cw = Math.min(cellW, (usableW - (totalSlots - 1) * cellGap) / totalSlots);
+
+      // title
+      svg.appendChild(S("text", { x: 24, y: 26, class: "svg-title",
+        text: NM === 1 ? "One microbatch in flight" : NM + " microbatches in flight" }));
+
+      // time axis label
+      svg.appendChild(S("text", { x: leftX, y: 44, class: "svg-label", text: "time →" }));
+
+      let busy = 0, idle = 0;
+      for (let g = 0; g < NG; g++) {
+        const y = topY + g * (rowH + rowGap);
+        // GPU device frame
+        gpuBox(svg, 14, y, 124, rowH, null, { fill: "#0c1422" });
+        svg.appendChild(S("text", { x: 26, y: y + 23, class: "svg-title",
+          "font-size": 13, text: "GPU " + g }));
+        svg.appendChild(S("rect", { x: 26, y: y + 31, width: 100, height: 14, rx: 4,
+          fill: C.weight, opacity: 0.30 }));
+        svg.appendChild(S("text", { x: 30, y: y + 42, class: "svg-label",
+          "font-size": 10, fill: C.weight, text: layerNames[g] }));
+
+        // time grid cells
+        for (let t = 0; t < totalSlots; t++) {
+          const x = leftX + t * (cw + cellGap);
+          // which microbatch (if any) is at stage g during slot t?
+          let mbHere = -1;
+          for (let m = 0; m < NM; m++) { if (diag(g, m) === t) { mbHere = m; break; } }
+          const reveal = ease(IOP.clamp(p * totalSlots - t, 0, 1));
+          if (mbHere >= 0) {
+            busy++;
+            svg.appendChild(S("rect", { x, y: y + 8, width: cw, height: rowH - 16, rx: 6,
+              fill: C.compute, opacity: 0.30 + 0.55 * reveal }));
+            svg.appendChild(S("text", { x: x + cw/2, y: y + rowH/2 + 4, "text-anchor": "middle",
+              "font-family": "var(--mono)", "font-size": 11, fill: "#04121f",
+              "font-weight": 700, text: "μ" + (mbHere + 1), opacity: reveal }));
+            // point-to-point handoff to next GPU (down-right)
+            if (g < NG - 1 && reveal > 0.6) {
+              const nx = leftX + (t + 1) * (cw + cellGap);
+              arrow(svg, x + cw, y + rowH - 6, nx + cw/2, y + rowH + rowGap + 8, C.mem,
+                { w: 1.6, opacity: 0.55 });
+            }
+          } else {
+            idle++;
+            // bubble cell
+            svg.appendChild(S("rect", { x, y: y + 8, width: cw, height: rowH - 16, rx: 6,
+              fill: "none", stroke: C.warn, "stroke-width": 1,
+              "stroke-dasharray": "3 3", opacity: 0.25 + 0.35 * reveal }));
+          }
+        }
+      }
+
+      // bubble fraction read-out
+      const total = busy + idle;
+      const frac = total ? Math.round(100 * idle / total) : 0;
+      const by = topY + NG * (rowH + rowGap) + 14;
+      svg.appendChild(S("rect", { x: 14, y: by, width: 250, height: 30, rx: 8,
+        fill: "#0c1422", stroke: C.border }));
+      svg.appendChild(S("text", { x: 26, y: by + 20, class: "svg-label",
+        text: "bubble (idle) fraction: " }));
+      svg.appendChild(S("text", { x: 196, y: by + 20, "font-family": "var(--mono)",
+        "font-size": 14, "font-weight": 700,
+        fill: frac > 35 ? C.warn : C.compute, text: frac + "%" }));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlA"),
+      caption:  document.getElementById("capA"),
+      captions: [
+        "<b>Pipeline parallelism</b> splits the model's <span class='k'>layers</span> across GPUs — GPU 0 holds layers 1–8, GPU 1 the next slice, and so on. A request is processed by one stage, then forwarded to the next.",
+        "Send <b>one microbatch</b> through. It moves stage→stage via <span class='k'>point-to-point</span> handoffs (just to the one next GPU). But notice: while it works its way down, every other GPU sits idle.",
+        "Those red dashed cells during fill and drain are the <b>pipeline bubble</b> — wasted GPU time. With only one batch the bubble is huge. The fix is to feed in <span class='k'>more microbatches</span>.",
+        "With <b>6 microbatches</b> overlapping, the steady-state middle keeps all four GPUs busy at once. The fixed fill/drain cost is now amortized — the <span class='k'>bubble fraction</span> shrinks dramatically.",
+      ],
+      render,
+      dwell: 2000,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 2 — Tensor parallelism (Stepper) =====================
+  (function () {
+    const svg = document.getElementById("svgB");
+    const { S, C, clear, ease, lerp } = IOP;
+    const NG = 3;
+    const gx = [120, 410, 700], gw = 180, gy = 120, gh = 150;
+    const inY = 46, outY = 330;
+
+    function gpuFrame(i, hi) {
+      gpuBox(svg, gx[i], gy, gw, gh, "GPU " + i,
+        { stroke: hi ? C.compute : C.border, sw: hi ? 2.5 : 1.5 });
+    }
+
+    function render(step, p) {
+      clear(svg);
+      const e = ease(p);
+
+      svg.appendChild(S("text", { x: 24, y: 26, class: "svg-title",
+        text: "One matmul:  Y = X · W   (W split column-wise into W₀ | W₁ | W₂)" }));
+
+      // input activations block (top, centered)
+      const ix = 410, iw = 120;
+      svg.appendChild(S("rect", { x: ix, y: inY - 18, width: iw, height: 30, rx: 7,
+        fill: C.token, opacity: 0.85 }));
+      svg.appendChild(S("text", { x: ix + iw/2, y: inY + 2, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 12, fill: "#04121f", "font-weight": 700,
+        text: "input X" }));
+
+      for (let i = 0; i < NG; i++) {
+        const cx = gx[i] + gw/2;
+        const active = step >= 2;
+        gpuFrame(i, step >= 2 && step <= 3);
+
+        // weight shard inside GPU (always present from step >=1)
+        if (step >= 1) {
+          const sr = ease(IOP.clamp(p * (step === 1 ? 1 : 3) - i, 0, 1));
+          svg.appendChild(S("rect", { x: gx[i] + 20, y: gy + 30, width: gw - 40, height: 38, rx: 7,
+            fill: C.weight, opacity: 0.85 * (step === 1 ? sr : 1) }));
+          svg.appendChild(S("text", { x: cx, y: gy + 54, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 12, fill: "#0c0820", "font-weight": 700,
+            text: "W" + i, opacity: (step === 1 ? sr : 1) }));
+        }
+
+        // broadcast input -> each GPU (step >=2)
+        if (step >= 2) {
+          const a = step === 2 ? e : 1;
+          arrow(svg, ix + iw/2, inY + 12, cx, gy - 4, C.mem, { w: 2, opacity: 0.5 + 0.4 * a });
+        }
+
+        // partial compute result (step >=2)
+        if (step >= 2) {
+          const cr = step === 2 ? ease(IOP.clamp(p * 3 - i, 0, 1)) : 1;
+          svg.appendChild(S("rect", { x: gx[i] + 28, y: gy + 92, width: gw - 56, height: 34, rx: 7,
+            fill: C.compute, opacity: 0.30 + 0.55 * cr }));
+          svg.appendChild(S("text", { x: cx, y: gy + 114, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 12, fill: "#04121f", "font-weight": 700,
+            text: "Y" + i + " (partial)", opacity: cr }));
+        }
+      }
+
+      // AllReduce ring + combined output (step >=3)
+      if (step >= 3) {
+        const a = step === 3 ? e : 1;
+        // draw exchange arrows between GPUs (ring all-to-all flavor)
+        const yMid = gy + gh + 26;
+        for (let i = 0; i < NG; i++) {
+          const j = (i + 1) % NG;
+          arrow(svg, gx[i] + gw/2, gy + gh, gx[j] + gw/2, gy + gh,
+            C.mem, { w: 2, dash: "5 4", opacity: 0.5 * a });
+        }
+        svg.appendChild(S("text", { x: 460, y: yMid + 2, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 12, fill: C.mem, "font-weight": 700,
+          text: "AllReduce — exchange & sum partials", opacity: a }));
+      }
+
+      // final full output broadcast to all (step >=4)
+      if (step >= 4) {
+        const ox = 360, ow = 200;
+        svg.appendChild(S("rect", { x: ox, y: outY, width: ow, height: 34, rx: 7,
+          fill: C.compute, opacity: 0.92 }));
+        svg.appendChild(S("text", { x: ox + ow/2, y: outY + 22, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 12, fill: "#04121f", "font-weight": 700,
+          text: "full output Y → next layer" }));
+        for (let i = 0; i < NG; i++) {
+          arrow(svg, gx[i] + gw/2, gy + gh + 6, ox + ow/2, outY - 2, C.compute,
+            { w: 1.6, opacity: 0.45 });
+        }
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlB"),
+      caption:  document.getElementById("capB"),
+      captions: [
+        "Inside every layer sits a big matrix multiply <code>Y = X·W</code>. <b>Tensor parallelism</b> splits the weight matrix <span class='k'>W</span> across GPUs — here column-wise into W₀, W₁, W₂.",
+        "Each GPU holds only its <b>weight shard</b>. No single GPU stores the whole matrix — which is exactly what lets a layer too big for one GPU still run.",
+        "The same <b>input X is broadcast</b> to all GPUs. Each multiplies X by its shard, producing a <span class='k'>partial</span> output Yᵢ — a slice of the answer, computed in parallel.",
+        "Partials alone aren't the layer output. An <b>AllReduce</b> exchanges and sums them across GPUs — a scatter-gather-reduce collective fired after <span class='k'>every</span> layer's matmul.",
+        "Now every GPU holds the <b>full output Y</b>, ready as input to the next layer. All GPUs stayed busy at once — great latency, but the per-layer AllReduce means heavy <span class='k'>communication</span>.",
+      ],
+      render,
+      dwell: 2100,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE 3 — Expert parallelism (Loop) =====================
+  (function () {
+    const svg = document.getElementById("svgC");
+    const { S, C, clear, lerp } = IOP;
+    const NG = 4;
+    const gx = [70, 280, 490, 700], gw = 150, gy = 150, gh = 150;
+    const routerX = 460, routerY = 56;
+
+    // tokens: each assigned to an expert/GPU. One expert (GPU 2) is overloaded -> stall.
+    const TOKENS = [
+      { id: "t1", exp: 0 }, { id: "t2", exp: 2 }, { id: "t3", exp: 1 },
+      { id: "t4", exp: 2 }, { id: "t5", exp: 3 }, { id: "t6", exp: 2 },
+    ];
+    // count load per expert
+    const load = [0,0,0,0]; TOKENS.forEach(t => load[t.exp]++);
+    const maxLoad = Math.max(...load);
+
+    function expertCx(i) { return gx[i] + gw/2; }
+
+    function render(time) {
+      clear(svg);
+      // phase cycle: dispatch (0-0.35) -> compute (0.35-0.7) -> combine (0.7-1)
+      const cyc = (time * 0.28) % 1;
+      const phase = cyc < 0.35 ? "dispatch" : cyc < 0.7 ? "compute" : "combine";
+
+      svg.appendChild(S("text", { x: 24, y: 26, class: "svg-title",
+        text: "MoE layer — router dispatches each token to its expert's GPU (top-1 shown)" }));
+
+      // router box
+      svg.appendChild(S("rect", { x: routerX - 90, y: routerY - 20, width: 180, height: 34, rx: 9,
+        fill: "#0c1422", stroke: C.accent, "stroke-width": 2 }));
+      svg.appendChild(S("text", { x: routerX, y: routerY + 2, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 12, fill: C.accent, "font-weight": 700,
+        text: "router (top-k)" }));
+
+      // phase label
+      const phaseLabel = phase === "dispatch" ? "all-to-all dispatch →"
+        : phase === "compute" ? "experts compute (FFN)"
+        : "← all-to-all combine";
+      svg.appendChild(S("text", { x: 24, y: 48, class: "svg-label",
+        fill: phase === "compute" ? C.compute : C.mem, text: "phase: " + phaseLabel }));
+
+      // GPUs / experts
+      for (let i = 0; i < NG; i++) {
+        const overloaded = load[i] === maxLoad && maxLoad > 1;
+        const computing = phase === "compute";
+        const stalled = computing && overloaded; // slowest expert stalls the pass
+        gpuBox(svg, gx[i], gy, gw, gh, "GPU " + i,
+          { stroke: stalled ? C.warn : (computing ? C.compute : C.border),
+            sw: stalled ? 2.5 : (computing ? 2.5 : 1.5) });
+        // expert weights block
+        svg.appendChild(S("rect", { x: gx[i] + 24, y: gy + 34, width: gw - 48, height: 40, rx: 8,
+          fill: C.weight, opacity: 0.85 }));
+        svg.appendChild(S("text", { x: expertCx(i), y: gy + 59, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 12, fill: "#0c0820", "font-weight": 700,
+          text: "Expert " + i }));
+        // load tag
+        svg.appendChild(S("text", { x: expertCx(i), y: gy + gh - 12, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 10,
+          fill: overloaded ? C.warn : C.muted,
+          text: load[i] + (load[i] === 1 ? " token" : " tokens") + (overloaded ? "  ⟂ hot" : "") }));
+
+        // compute glow
+        if (computing) {
+          const pulse = stalled ? (0.4 + 0.3 * Math.sin(time * 6))   // stalled flickers
+                                : (0.45 + 0.35 * Math.sin(time * 4 + i));
+          svg.appendChild(S("rect", { x: gx[i] + 16, y: gy + 84, width: gw - 32, height: 18, rx: 6,
+            fill: stalled ? C.warn : C.compute, opacity: pulse }));
+          if (stalled)
+            svg.appendChild(S("text", { x: expertCx(i), y: gy + 97, "text-anchor": "middle",
+              "font-family": "var(--mono)", "font-size": 9, fill: "#1a0606", "font-weight": 700,
+              text: "STALL" }));
+        }
+      }
+
+      // tokens animate between router and their expert GPU
+      TOKENS.forEach((tk, k) => {
+        const cx0 = routerX - 70 + (k % 6) * 28;   // staging near router
+        const startX = cx0, startY = routerY + 26;
+        const ex = expertCx(tk.exp), ey = gy + gh + 18; // landing just below GPU
+        let x, y, op = 1, col = C.token;
+        if (phase === "dispatch") {
+          const t = IOP.clamp(cyc / 0.35, 0, 1);
+          x = lerp(startX, ex, IOP.ease(t));
+          y = lerp(startY, ey, IOP.ease(t));
+          col = C.mem;
+        } else if (phase === "compute") {
+          x = ex + (k % 2 ? 16 : -16); y = ey;        // parked at expert
+          col = C.token;
+        } else { // combine
+          const t = IOP.clamp((cyc - 0.7) / 0.3, 0, 1);
+          x = lerp(ex, startX, IOP.ease(t));
+          y = lerp(ey, startY, IOP.ease(t));
+          col = C.compute;
+        }
+        // dispatch/combine path hint
+        if (phase === "dispatch") arrow(svg, startX, startY, ex, ey, C.mem, { w: 1, opacity: 0.18 });
+        if (phase === "combine")  arrow(svg, ex, ey, startX, startY, C.compute, { w: 1, opacity: 0.18 });
+        svg.appendChild(S("circle", { cx: x, cy: y, r: 9, fill: col,
+          stroke: "#04121f", "stroke-width": 1.2 }));
+        svg.appendChild(S("text", { x, y: y + 3, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 8, fill: "#04121f", "font-weight": 700,
+          text: tk.id }));
+      });
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrlC"), render, autoplay: true, speed: 1 });
+  })();
+
+  // ===================== FIGURE 4 — Side-by-side summary (Stepper) =====================
+  (function () {
+    const svg = document.getElementById("svgD");
+    const { S, C, clear, ease } = IOP;
+
+    // three mini-panels
+    const panels = [
+      { x: 24,  title: "Pipeline",  splits: "whole layers",
+        comm: "point-to-point", commColor: C.mem, cost: "low comm",
+        costColor: C.compute, note: "across nodes" },
+      { x: 324, title: "Tensor",    splits: "within-layer matmul",
+        comm: "AllReduce / all-gather", commColor: C.mem, cost: "high comm",
+        costColor: C.warn, note: "within a node (NVLink)" },
+      { x: 624, title: "Expert",    splits: "experts (MoE)",
+        comm: "all-to-all", commColor: C.mem, cost: "cluster-wide",
+        costColor: C.warn, note: "MoE feed-forward" },
+    ];
+    const pw = 272, py = 60, ph = 200;
+
+    function drawPanel(pn, idx, hi, p) {
+      const e = ease(p);
+      const op = hi ? 1 : 0.42;
+      // card
+      svg.appendChild(S("rect", { x: pn.x, y: py, width: pw, height: ph, rx: 12,
+        fill: "#0c1422", stroke: hi ? C.accent : C.border, "stroke-width": hi ? 2 : 1.4,
+        opacity: hi ? 1 : 0.55 }));
+      svg.appendChild(S("text", { x: pn.x + 16, y: py + 28, class: "svg-title",
+        "font-size": 16, opacity: op, text: pn.title }));
+      svg.appendChild(S("text", { x: pn.x + 16, y: py + 46, class: "svg-label",
+        "font-size": 11, opacity: op, text: "parallelism" }));
+
+      // "what it splits" — weight-colored
+      svg.appendChild(S("rect", { x: pn.x + 16, y: py + 60, width: pw - 32, height: 30, rx: 7,
+        fill: C.weight, opacity: (hi ? 0.9 : 0.4) * (hi ? e : 1) }));
+      svg.appendChild(S("text", { x: pn.x + 26, y: py + 79, "font-size": 12,
+        "font-family": "var(--mono)", fill: "#0c0820", "font-weight": 700,
+        opacity: hi ? e : 0.6, text: "splits: " + pn.splits }));
+
+      // comm pattern — mem-colored
+      svg.appendChild(S("rect", { x: pn.x + 16, y: py + 100, width: pw - 32, height: 30, rx: 7,
+        fill: pn.commColor, opacity: (hi ? 0.85 : 0.35) * (hi ? e : 1) }));
+      svg.appendChild(S("text", { x: pn.x + 26, y: py + 119, "font-size": 12,
+        "font-family": "var(--mono)", fill: "#04121f", "font-weight": 700,
+        opacity: hi ? e : 0.6, text: "comm: " + pn.comm }));
+
+      // cost chip
+      svg.appendChild(S("rect", { x: pn.x + 16, y: py + 142, width: 120, height: 26, rx: 13,
+        fill: "none", stroke: pn.costColor, "stroke-width": 1.6, opacity: op }));
+      svg.appendChild(S("text", { x: pn.x + 76, y: py + 159, "text-anchor": "middle",
+        "font-size": 11, "font-family": "var(--mono)", fill: pn.costColor, "font-weight": 700,
+        opacity: op, text: pn.cost }));
+
+      // placement note
+      svg.appendChild(S("text", { x: pn.x + 16, y: py + ph - 12, "font-size": 11,
+        "font-family": "var(--mono)", fill: C.faint, opacity: op, text: "best: " + pn.note }));
+    }
+
+    function render(step, p) {
+      clear(svg);
+      svg.appendChild(S("text", { x: 24, y: 30, class: "svg-title",
+        text: step < 3 ? "Pick the split that matches your interconnect" : "…and combine them" }));
+
+      // highlight one panel per step 0..2; step 3 shows the combined picture
+      for (let i = 0; i < 3; i++) {
+        const hi = step === 3 ? true : (i === step);
+        drawPanel(panels[i], i, hi, hi && step < 3 ? p : 1);
+      }
+
+      if (step === 3) {
+        const e = ease(p);
+        // combined deployment band at bottom
+        const by = py + ph + 18;
+        svg.appendChild(S("rect", { x: 24, y: by, width: 872, height: 56, rx: 12,
+          fill: "#0c1422", stroke: C.accent, "stroke-width": 1.4, opacity: 0.6 }));
+        // intra-node group (TP) inside a node, two nodes joined by PP
+        const node = (nx, lbl) => {
+          svg.appendChild(S("rect", { x: nx, y: by + 12, width: 230, height: 32, rx: 8,
+            fill: "none", stroke: C.compute, "stroke-dasharray": "5 4", "stroke-width": 1.6,
+            opacity: e }));
+          svg.appendChild(S("text", { x: nx + 8, y: by + 9, "font-size": 10,
+            "font-family": "var(--mono)", fill: C.compute, opacity: e, text: lbl }));
+          for (let g = 0; g < 3; g++)
+            svg.appendChild(S("rect", { x: nx + 14 + g * 70, y: by + 18, width: 56, height: 20, rx: 5,
+              fill: C.compute, opacity: 0.35 * e }));
+        };
+        node(70, "node A · tensor-parallel (NVLink)");
+        node(440, "node B · tensor-parallel (NVLink)");
+        // inter-node PP link
+        arrow(svg, 300, by + 28, 440, by + 28, C.accent, { w: 2.4, opacity: e });
+        svg.appendChild(S("text", { x: 370, y: by + 22, "text-anchor": "middle", "font-size": 10,
+          "font-family": "var(--mono)", fill: C.accent, "font-weight": 700, opacity: e,
+          text: "pipeline (network)" }));
+        svg.appendChild(S("text", { x: 690, y: by + 30, "font-size": 11,
+          "font-family": "var(--mono)", fill: C.muted, opacity: e,
+          text: "+ expert-parallel FFN" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlD"),
+      caption:  document.getElementById("capD"),
+      captions: [
+        "<b>Pipeline parallelism</b> splits <span class='k'>whole layers</span> and only needs point-to-point handoffs. Its low communication cost makes it the pick for <span class='k'>inter-node</span> deployments with slower links.",
+        "<b>Tensor parallelism</b> splits the <span class='k'>within-layer matmul</span> and pays an AllReduce per layer — high communication. Worth it <span class='k'>inside a node</span> over fast NVLink, where every GPU stays busy.",
+        "<b>Expert parallelism</b> splits <span class='k'>experts</span> in MoE models and routes tokens with all-to-all — a cluster-wide pattern where one slow expert stalls the whole pass.",
+        "They aren't exclusive — real deployments <b>combine</b> them: tensor parallelism <span class='k'>within</span> each node over NVLink, pipeline parallelism <span class='k'>across</span> nodes over the network, plus expert parallelism for the MoE feed-forward.",
+      ],
+      render,
+      dwell: 2200,
+      autoplay: false,
+    });
+  })();
+  </script>
+</body>
+</html>

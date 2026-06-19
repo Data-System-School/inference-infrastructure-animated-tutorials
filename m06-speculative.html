@@ -1,0 +1,773 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Speculative Decoding — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;6 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/speculative/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 6 · Latency &amp; throughput</div>
+      <h1>Speculative Decoding</h1>
+      <p class="lead">Decoding is memory-bound: each token costs one full sweep of the model's
+      weights out of HBM. Speculative decoding amortizes that sweep over <em>several</em> tokens —
+      a small fast model guesses ahead, the big model verifies the whole guess in one pass, and the
+      output is identical to plain sampling.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Core idea (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>One slow pass per token — versus many tokens per pass</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Baseline decoding emits one token per expensive target forward pass. Speculative
+      decoding drafts γ candidates cheaply, then verifies all of them in a single target pass.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 380" role="img" aria-label="Baseline decoding versus speculative draft-then-verify"></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> draft model (small)</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> target model (large)</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> accepted</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> rejected / corrected</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The win comes from <strong>amortization</strong>. Fetching the weights of a large model from HBM
+      dominates the cost of a decode step, and that cost is roughly the same whether the target processes
+      one token or a short batch of <code>γ+1</code> tokens in parallel — much like prefill. So if the draft
+      guesses well, several tokens "ride along" on a single weight sweep. Crucially, the accept/reject rule is
+      designed so the final stream is <strong>distributionally identical</strong> to sampling from the target alone.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Acceptance dynamics (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Acceptance dynamics: speedup rides on the acceptance rate</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Each round drafts γ tokens and verifies them in <em>one</em> target pass. Sometimes most
+      are accepted (big speedup); sometimes the draft is rejected early (little gain). Verification cost ≈ one
+      pass regardless of γ.</p>
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 360" role="img" aria-label="Several rounds of drafting and verification with varying acceptance"></svg>
+      </div>
+      <div id="ctrl2"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> drafted</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> accepted (kept)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> rejected + corrected</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> one target pass</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Tradeoff</span>
+      The <strong>lookahead window</strong> γ (commonly 3–12) is tuned empirically. Too small and you leave
+      speedup on the table; too large and you waste compute drafting tokens that get thrown away. Speculative
+      decoding trades extra compute for better memory-bandwidth use, so it shines most for <strong>large models
+      at small batch sizes</strong> (memory-bound) and helps less as batches grow compute-bound.
+    </div>
+
+    <!-- ================= FIGURE 3 — Medusa tree (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Tree drafting — Medusa heads + tree attention</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Instead of one linear guess, Medusa adds several decoding heads to the frozen target.
+      Their top-k predictions form a <em>tree</em> of candidate continuations, all verified in a single pass via
+      tree attention; the longest validated path is kept.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 400" role="img" aria-label="Medusa heads forming a candidate tree verified with tree attention"></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+      <div id="cap3" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> Medusa head / candidate</span>
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> frozen target trunk</span>
+        <span class="item"><span class="sw" style="background:var(--good)"></span> validated path (kept)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> pruned / rejected</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Medusa's heads are <strong>independent</strong> — each predicts its position without seeing earlier
+      heads' choices, so an early miss can invalidate a whole linear draft. The tree hedges against this: by
+      validating several candidate sequences (the pruned Cartesian product of per-head top-k, the
+      <em>Medusa tree</em>) in one pass, it keeps the candidate with the most accepted tokens.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — Better/cheaper drafters (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Better drafters: EAGLE features &amp; Multi-Token Prediction</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">All four schemes are just different ways to produce drafts. They trade off draft accuracy
+      against memory and where the prediction happens — on tokens, on hidden features, or inside the model itself.</p>
+
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 380" role="img" aria-label="Comparing draft-target, EAGLE feature-level drafting, and multi-token prediction"></svg>
+      </div>
+
+      <div id="ctrl4"></div>
+      <div id="cap4" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--accent)"></span> target trunk / features</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> drafter (model / decoder / heads)</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> draft tokens</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>EAGLE drafts at the <strong>feature level</strong>: a lightweight decoder reads the target's own hidden
+      states instead of just its emitted tokens, cutting prediction uncertainty and lifting the acceptance rate.
+      <strong>MTP</strong> bakes drafting into training — the model learns to predict the next <code>n</code> tokens
+      via shallow per-token heads on a shared trunk, so any MTP model can spec-decode for free. The recurring theme:
+      a cheaper, more accurate drafter means more tokens accepted per target pass.</p>
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m05-flashattention.html"><span class="dir">← Previous</span><span class="ttl">I/O-Aware Kernels</span></a>
+      <a class="next" href="m07-disaggregation.html"><span class="dir">Next →</span><span class="ttl">Prefill-Decode Scheduling and Disaggregation</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  "use strict";
+
+  /* ===================== shared little drawing helpers ===================== */
+  const { S, C, clear, lerp, ease, easeOut } = IOP;
+
+  // a token chip with optional letter
+  function chip(x, y, w, h, fill, label, opts) {
+    opts = opts || {};
+    const g = S("g", { opacity: opts.opacity != null ? opts.opacity : 1 });
+    g.appendChild(S("path", {
+      d: IOP.rr(x, y, w, h, 7),
+      fill: opts.solid ? fill : "rgba(56,189,248,.10)",
+      stroke: fill, "stroke-width": opts.sw || 1.6
+    }));
+    if (label != null) g.appendChild(S("text", {
+      x: x + w / 2, y: y + h / 2 + 4, "text-anchor": "middle",
+      "font-family": "var(--mono)", "font-size": opts.fs || 13,
+      "font-weight": 600, fill: opts.textFill || (opts.solid ? "#04121f" : C.text), text: label
+    }));
+    return g;
+  }
+
+  function boxLabel(x, y, t, fill, fs) {
+    return S("text", { x, y, "font-family": "var(--mono)", "font-size": fs || 12,
+      fill: fill || C.muted, text: t });
+  }
+
+  /* ===================================================================
+     FIGURE 1 — Core idea: baseline vs speculative (Stepper)
+     =================================================================== */
+  (function () {
+    const svg = document.getElementById("svg1");
+
+    // The reference sequence the target ultimately produces.
+    const truth = ["The", "cat", "sat", "on", "the", "mat"];
+    // What the draft model proposes at step 2 (one wrong near the end).
+    const draft = ["sat", "on", "a", "rug"];          // proposes after "The cat"
+    const draftOK = [true, true, false, false];        // a/rug are wrong -> "the" corrected
+
+    function passBox(x, y, w, h, label, fill, p, dashed) {
+      const g = S("g");
+      g.appendChild(S("path", {
+        d: IOP.rr(x, y, w, h, 10),
+        fill: "none", stroke: fill, "stroke-width": 2,
+        "stroke-dasharray": dashed ? "6 5" : "none",
+        opacity: 0.35 + 0.65 * p
+      }));
+      g.appendChild(S("text", { x: x + 12, y: y + 20, "font-family": "var(--mono)",
+        "font-size": 12, fill: fill, "font-weight": 600, text: label, opacity: 0.4 + 0.6 * p }));
+      return g;
+    }
+
+    function render(step, p) {
+      clear(svg);
+
+      // ---------------- TOP: baseline (always shown) ----------------
+      svg.appendChild(boxLabel(28, 30, "BASELINE  ·  1 target pass → 1 token", C.muted, 13));
+      const by = 46, bh = 64, x0 = 28, cw = 78, gap = 10;
+      // number of tokens revealed in baseline grows with step (caps at all)
+      const revealed = Math.min(truth.length, 1 + step + (step >= 1 ? 0 : 0));
+      const baseShown = step === 0 ? Math.round(lerp(0, 2, p)) : Math.min(truth.length, 2 + (step));
+      const nBase = Math.max(1, Math.min(truth.length, baseShown));
+      for (let i = 0; i < truth.length; i++) {
+        const x = x0 + i * (cw + gap);
+        const on = i < nBase;
+        svg.appendChild(chip(x, by, cw, bh, on ? C.accent : C.border, on ? truth[i] : "·",
+          { solid: false, opacity: on ? 1 : 0.3 }));
+        if (on) {
+          // each token carries its own little "pass" tag
+          svg.appendChild(S("text", { x: x + cw / 2, y: by + bh + 16, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 10, fill: C.faint, text: "pass " + (i + 1) }));
+        }
+      }
+      svg.appendChild(S("text", { x: x0 + truth.length * (cw + gap) + 6, y: by + bh / 2 + 4,
+        "font-family": "var(--mono)", "font-size": 11, fill: C.warn,
+        text: truth.length + " passes" }));
+
+      // divider
+      svg.appendChild(S("line", { x1: 28, y1: 178, x2: 892, y2: 178, stroke: C.borderSoft, "stroke-width": 1 }));
+
+      // ---------------- BOTTOM: speculative ----------------
+      svg.appendChild(boxLabel(28, 208, "SPECULATIVE  ·  draft γ=4, then verify all in 1 target pass", C.muted, 13));
+      const sy = 226, sh = 64;
+      // context already committed: "The cat"
+      const ctx = ["The", "cat"];
+      let cx = x0;
+      for (let i = 0; i < ctx.length; i++) {
+        svg.appendChild(chip(cx, sy, cw, sh, C.accent, ctx[i], { solid: false }));
+        cx += cw + gap;
+      }
+      // a small bracket showing committed context
+      svg.appendChild(S("text", { x: x0, y: sy + sh + 16, "font-family": "var(--mono)",
+        "font-size": 10, fill: C.faint, text: "committed" }));
+
+      const dx0 = cx; // where drafts begin
+      // STEP-dependent reveal of the speculative mechanism
+      if (step >= 0) {
+        // draft chips appear (violet) as the small model proposes
+        const nDraftVisible = step === 0 ? Math.round(lerp(0, draft.length, p)) : draft.length;
+        for (let i = 0; i < nDraftVisible; i++) {
+          const x = dx0 + i * (cw + gap);
+          svg.appendChild(chip(x, sy, cw, sh, C.weight, draft[i], { solid: false }));
+        }
+        if (step === 0) {
+          svg.appendChild(boxLabel(dx0, sy - 16, "draft model proposes →", C.weight, 12));
+        }
+      }
+
+      if (step >= 1) {
+        // verification box drawn over all draft chips (single target pass)
+        const vx = dx0 - 6, vw = draft.length * (cw + gap) - gap + 12;
+        const vp = step === 1 ? p : 1;
+        svg.appendChild(passBox(vx, sy - 12, vw, sh + 24, "1 target pass verifies all γ in parallel", C.accent, vp));
+      }
+
+      if (step >= 2) {
+        // accept/reject coloring
+        for (let i = 0; i < draft.length; i++) {
+          const x = dx0 + i * (cw + gap);
+          const ok = draftOK[i];
+          // first mismatch index
+          const firstBad = draftOK.indexOf(false);
+          const accepted = i < firstBad;
+          const isCorrected = i === firstBad;
+          let col, lab, solid = false;
+          if (accepted) { col = C.good; lab = draft[i]; solid = true; }
+          else if (isCorrected) { col = C.warn; lab = "the"; solid = true; }   // target's corrected token
+          else { col = C.warn; lab = draft[i]; }
+          const op = (!accepted && !isCorrected) ? (step === 2 ? lerp(1, 0.28, p) : 0.28) : 1;
+          svg.appendChild(chip(x, sy, cw, sh, col, lab, { solid: solid, opacity: op,
+            textFill: solid ? "#04121f" : C.muted }));
+          // marks
+          if (accepted) svg.appendChild(S("text", { x: x + cw / 2, y: sy + sh + 16, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 11, fill: C.good, text: "✓ kept" }));
+          else if (isCorrected) svg.appendChild(S("text", { x: x + cw / 2, y: sy + sh + 16, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 10, fill: C.warn, text: "✗→fix" }));
+          else svg.appendChild(S("text", { x: x + cw / 2, y: sy + sh + 16, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 11, fill: C.warn, text: "✗" }));
+        }
+      }
+
+      if (step >= 3) {
+        // tally: tokens gained this pass
+        const tally = step === 3 ? p : 1;
+        svg.appendChild(S("text", { x: 640, y: 208, "font-family": "var(--mono)",
+          "font-size": 13, fill: C.good, opacity: tally,
+          text: "→ 3 tokens committed in 1 pass" }));
+        svg.appendChild(S("text", { x: 640, y: 350, "font-family": "var(--mono)",
+          "font-size": 11, fill: C.muted, opacity: tally,
+          text: "output ≡ plain target sampling" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption:  document.getElementById("cap1"),
+      captions: [
+        "<b>The draft.</b> Baseline (top) spends <span class='k'>one full target pass per token</span> — six tokens, six expensive weight sweeps. Below, a small fast <span class='k'>draft model</span> cheaply proposes γ=4 candidate tokens after the committed context.",
+        "<b>Verify in parallel.</b> The big <span class='k'>target model</span> ingests all four candidates at once and runs a <span class='k'>single forward pass</span> — like a mini-prefill with causal masking — scoring every candidate position together.",
+        "<b>Accept the prefix, fix the break.</b> Keep the <span class='k'>longest correct prefix</span> (\"sat on\" ✓). At the <span class='k'>first mismatch</span> reject the rest and take the target's own <span class='k'>corrected token</span> (\"the\").",
+        "<b>Net win.</b> This pass committed <span class='k'>3 tokens for the price of one</span> target sweep. When the draft guesses well you get several tokens per pass — and the output is <span class='k'>identical</span> to sampling from the target directly.",
+      ],
+      render,
+      dwell: 2100,
+      autoplay: false,
+    });
+  })();
+
+  /* ===================================================================
+     FIGURE 2 — Acceptance dynamics across rounds (Loop)
+     =================================================================== */
+  (function () {
+    const svg = document.getElementById("svg2");
+    const gamma = 5;
+    // pre-scripted rounds: how many of the γ drafts get accepted before a miss.
+    // (the +1 corrected token is always committed too)
+    const rounds = [
+      { acc: 5, label: "great guess" },   // all accepted -> +1 free
+      { acc: 1, label: "early miss" },
+      { acc: 4, label: "good" },
+      { acc: 0, label: "first token wrong" },
+      { acc: 3, label: "decent" },
+    ];
+    const ROUND_T = 1.6; // seconds per round (scaled)
+
+    function render(t) {
+      clear(svg);
+
+      const x0 = 30, top = 40, cw = 60, gap = 8, rowH = 56;
+      svg.appendChild(boxLabel(x0, 24, "ROUNDS  ·  each row = draft γ=5 tokens, verify in ONE target pass", C.muted, 13));
+
+      // continuous index into rounds
+      const total = rounds.length;
+      const phase = (t / ROUND_T);
+      const activeRound = Math.floor(phase) % total;
+      const localP = phase - Math.floor(phase); // 0..1 within active round
+
+      let committedTotal = 0, passTotal = 0;
+
+      for (let r = 0; r < total; r++) {
+        const ry = top + r * rowH;
+        const isActive = r === activeRound;
+        const isPast = r < activeRound;
+        // reveal animation only for the active row
+        const reveal = isActive ? localP : (isPast ? 1 : 0);
+        const rowOpacity = (r <= activeRound) ? 1 : 0.18;
+
+        // round label / pass marker on the left
+        svg.appendChild(S("circle", { cx: x0 - 6, cy: ry + rowH / 2 - 6, r: 5,
+          fill: (r <= activeRound) ? C.accent : C.border, opacity: rowOpacity }));
+
+        const acc = rounds[r].acc;
+        // count this row toward totals once it's been (at least partly) processed
+        if (r < activeRound || (isActive && localP > 0.55)) {
+          committedTotal += Math.min(gamma, acc) + 1; // accepted prefix + 1 corrected
+          passTotal += 1;
+        }
+
+        for (let i = 0; i < gamma; i++) {
+          const x = x0 + 18 + i * (cw + gap);
+          // staggered entrance
+          const cp = IOP.clamp((reveal - i * 0.06) / 0.4, 0, 1);
+          if (cp <= 0) continue;
+          const accepted = i < acc;
+          const isFirstMiss = i === acc;
+          let col = C.weight, solid = false, lab = "d" + (i + 1);
+          // only color accept/reject after ~60% reveal to feel like "verify then decide"
+          const decided = isActive ? (localP > 0.55) : isPast;
+          if (decided) {
+            if (accepted) { col = C.good; solid = true; lab = "✓"; }
+            else if (isFirstMiss) { col = C.warn; solid = true; lab = "fix"; }
+            else { col = C.warn; solid = false; lab = "·"; }
+          }
+          const op = (decided && !accepted && !isFirstMiss) ? 0.3 : (cp * rowOpacity);
+          svg.appendChild(chip(x, ry, cw, rowH - 14, col, lab, { solid: solid, opacity: op, fs: 12,
+            textFill: solid ? "#04121f" : C.muted }));
+        }
+
+        // single-pass bracket drawn over the row (cost is one pass no matter what)
+        const bx = x0 + 18 - 5, bw = gamma * (cw + gap) - gap + 10, byy = ry - 5, bhh = rowH - 14 + 10;
+        const bp = IOP.clamp(reveal / 0.5, 0, 1);
+        if (bp > 0) {
+          svg.appendChild(S("path", { d: IOP.rr(bx, byy, bw, bhh, 9), fill: "none",
+            stroke: C.accent, "stroke-width": 1.5, "stroke-dasharray": "5 5",
+            opacity: 0.5 * bp * rowOpacity }));
+        }
+
+        // per-row result tag
+        const tagX = x0 + 18 + gamma * (cw + gap) + 6;
+        const decidedRow = isActive ? (localP > 0.55) : isPast;
+        if (decidedRow) {
+          const gained = Math.min(gamma, acc) + 1;
+          svg.appendChild(S("text", { x: tagX, y: ry + (rowH - 14) / 2 - 2,
+            "font-family": "var(--mono)", "font-size": 12,
+            fill: gained >= 4 ? C.good : (gained <= 2 ? C.warn : C.muted),
+            text: "+" + gained + " tok / 1 pass", opacity: rowOpacity }));
+          svg.appendChild(S("text", { x: tagX, y: ry + (rowH - 14) / 2 + 13,
+            "font-family": "var(--mono)", "font-size": 10, fill: C.faint,
+            text: rounds[r].label, opacity: rowOpacity }));
+        }
+      }
+
+      // running speedup readout
+      const yRead = top + total * rowH + 14;
+      svg.appendChild(S("line", { x1: x0, y1: yRead - 8, x2: 892, y2: yRead - 8,
+        stroke: C.borderSoft, "stroke-width": 1 }));
+      const speed = passTotal > 0 ? (committedTotal / passTotal) : 0;
+      svg.appendChild(S("text", { x: x0, y: yRead + 12, "font-family": "var(--mono)",
+        "font-size": 13, fill: C.text,
+        text: "so far:  " + committedTotal + " tokens  /  " + passTotal + " target passes" }));
+      svg.appendChild(S("text", { x: 560, y: yRead + 12, "font-family": "var(--mono)",
+        "font-size": 13, fill: speed >= 2 ? C.good : C.muted,
+        text: "≈ " + (speed ? speed.toFixed(2) : "—") + "× tokens / pass" }));
+    }
+
+    IOP.Loop({ controls: document.getElementById("ctrl2"), render, autoplay: true, speed: 1 });
+  })();
+
+  /* ===================================================================
+     FIGURE 3 — Medusa tree drafting (Stepper)
+     =================================================================== */
+  (function () {
+    const svg = document.getElementById("svg3");
+
+    // tree layout: trunk -> head1 (2 options) -> head2 (2 options each) ...
+    // node = {x, y, label, ok}  edges connect consecutive levels along a path
+    const trunkX = 70, trunkY = 200;
+    const lvlX = [230, 430, 630, 820];
+
+    // candidate paths (Cartesian product, pruned). ok = on the winning path.
+    // head1 options
+    const h1 = [
+      { y: 130, label: "sat", paths: [
+        { label: "on", y: 80, win: true, next: [
+          { label: "the", y: 55, win: true }, { label: "a", y: 110, win: false } ] },
+        { label: "up", y: 180, win: false, next: [
+          { label: "and", y: 160, win: false }, { label: "to", y: 205, win: false } ] },
+      ]},
+      { y: 285, label: "ran", paths: [
+        { label: "to", y: 255, win: false, next: [
+          { label: "the", y: 235, win: false }, { label: "a", y: 280, win: false } ] },
+        { label: "off", y: 320, win: false, next: [
+          { label: "and", y: 305, win: false }, { label: "fast", y: 345, win: false } ] },
+      ]},
+    ];
+
+    function node(x, y, label, fill, p, solid, r) {
+      const g = S("g", { opacity: p });
+      const w = 62, h = 30;
+      g.appendChild(S("path", { d: IOP.rr(x - w / 2, y - h / 2, w, h, 8),
+        fill: solid ? fill : "rgba(167,139,250,.10)", stroke: fill, "stroke-width": solid ? 0 : 1.6 }));
+      g.appendChild(S("text", { x, y: y + 4, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 12, "font-weight": 600,
+        fill: solid ? "#04121f" : C.text, text: label }));
+      return g;
+    }
+    function edge(x1, y1, x2, y2, col, p, w) {
+      return S("line", { x1: x1 + 31, y1, x2: x2 - 31, y2,
+        stroke: col, "stroke-width": w || 1.6, opacity: p });
+    }
+
+    function render(step, p) {
+      clear(svg);
+
+      // ---- linear-draft contrast strip (top) shown in step 0 ----
+      // trunk node (frozen target)
+      const trunkP = step === 0 ? p : 1;
+      svg.appendChild(S("path", { d: IOP.rr(trunkX - 36, trunkY - 26, 72, 52, 9),
+        fill: "rgba(56,189,248,.10)", stroke: C.accent, "stroke-width": 2, opacity: trunkP }));
+      svg.appendChild(S("text", { x: trunkX, y: trunkY - 4, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 11, fill: C.accent, "font-weight": 600, text: "target", opacity: trunkP }));
+      svg.appendChild(S("text", { x: trunkX, y: trunkY + 12, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 10, fill: C.muted, text: "trunk", opacity: trunkP }));
+      svg.appendChild(S("text", { x: trunkX, y: trunkY + 44, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 10, fill: C.faint, text: '"the cat …"', opacity: trunkP }));
+
+      if (step === 0) {
+        // show a single LINEAR draft for contrast
+        svg.appendChild(boxLabel(200, 40, "LINEAR DRAFT  ·  one chain — an early miss kills the rest", C.muted, 13));
+        const seq = [["sat", true], ["on", true], ["a", false], ["rug", false]];
+        let px = lvlX[0], py = 130;
+        svg.appendChild(edge(trunkX, trunkY, px, py, C.weight, p, 1.8));
+        for (let i = 0; i < seq.length; i++) {
+          const x = lvlX[i], y = 130;
+          const np = IOP.clamp((p - i * 0.12) / 0.5, 0, 1);
+          svg.appendChild(node(x, y, seq[i][0], C.weight, np, false));
+          if (i > 0) svg.appendChild(edge(lvlX[i - 1], 130, x, y, C.weight, np, 1.6));
+        }
+        svg.appendChild(S("text", { x: lvlX[0], y: 175, "font-family": "var(--mono)",
+          "font-size": 11, fill: C.muted, opacity: p, text: "if \"a\" is wrong, \"rug\" is wasted too →" }));
+        return;
+      }
+
+      // ---- steps 1..3: the Medusa tree ----
+      svg.appendChild(boxLabel(160, 36, "MEDUSA  ·  k extra heads → a TREE of candidate continuations", C.muted, 13));
+
+      // head level labels
+      const headColor = C.weight;
+      if (step >= 1) {
+        const hp = step === 1 ? p : 1;
+        ["head 1", "head 2", "head 3"].forEach((t, i) => {
+          svg.appendChild(S("text", { x: lvlX[i], y: 372, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 10, fill: C.faint, text: t, opacity: hp * 0.9 }));
+        });
+      }
+
+      // build tree nodes/edges
+      // determine winning path coloring only at step>=2
+      const colorize = step >= 2;
+      const keepOnly = step >= 3; // prune losers visually
+
+      // level 1
+      h1.forEach((a, ai) => {
+        const x1 = lvlX[0], y1 = a.y;
+        const onWin = a.label === "sat";
+        const ep = step === 1 ? IOP.clamp(p / 0.5, 0, 1) : 1;
+        let col = headColor, solid = false, vis = 1;
+        if (colorize) {
+          if (onWin) { col = C.good; solid = true; }
+          else { col = C.warn; solid = false; vis = keepOnly ? 0.0 : 0.32; }
+        }
+        if (keepOnly && !onWin) vis = 0;
+        const showP = ep * (colorize ? (onWin ? 1 : vis) : 1);
+        svg.appendChild(edge(trunkX, trunkY, x1, y1, onWin && colorize ? C.good : headColor,
+          (colorize && !onWin) ? (keepOnly ? 0 : 0.3) : ep, onWin && colorize ? 2.4 : 1.6));
+        svg.appendChild(node(x1, y1, a.label, col, showP || (colorize && !onWin && !keepOnly ? 0.32 : showP), solid));
+
+        // level 2
+        a.paths.forEach((b) => {
+          const x2 = lvlX[1], y2 = b.y;
+          const onWin2 = onWin && b.win;
+          const ep2 = step === 1 ? IOP.clamp((p - 0.25) / 0.5, 0, 1) : 1;
+          let col2 = headColor, solid2 = false, vis2 = 1;
+          if (colorize) {
+            if (onWin2) { col2 = C.good; solid2 = true; }
+            else { col2 = C.warn; vis2 = keepOnly ? 0 : 0.3; }
+          }
+          if (keepOnly && !onWin2) vis2 = 0;
+          const edgeOp = (colorize && !onWin2) ? (keepOnly ? 0 : 0.28) : ep2;
+          svg.appendChild(edge(x1, y1, x2, y2, onWin2 && colorize ? C.good : headColor,
+            edgeOp, onWin2 && colorize ? 2.4 : 1.4));
+          svg.appendChild(node(x2, y2, b.label, col2,
+            (colorize && !onWin2) ? (keepOnly ? 0 : 0.3) : ep2, solid2));
+
+          // level 3
+          b.next.forEach((c) => {
+            const x3 = lvlX[2], y3 = c.y;
+            const onWin3 = onWin2 && c.win;
+            const ep3 = step === 1 ? IOP.clamp((p - 0.5) / 0.5, 0, 1) : 1;
+            let col3 = headColor, solid3 = false;
+            if (colorize) { if (onWin3) { col3 = C.good; solid3 = true; } else { col3 = C.warn; } }
+            const edgeOp3 = (colorize && !onWin3) ? (keepOnly ? 0 : 0.26) : ep3;
+            svg.appendChild(edge(x2, y2, x3, y3, onWin3 && colorize ? C.good : headColor,
+              edgeOp3, onWin3 && colorize ? 2.4 : 1.3));
+            svg.appendChild(node(x3, y3, c.label, col3,
+              (colorize && !onWin3) ? (keepOnly ? 0 : 0.28) : ep3, solid3));
+          });
+        });
+      });
+
+      // tree-attention sweep band (step 2) + kept-path tag (step 3)
+      if (step === 2) {
+        const sweepX = lerp(lvlX[0] - 40, lvlX[2] + 40, ease(p));
+        svg.appendChild(S("rect", { x: sweepX - 18, y: 40, width: 36, height: 320,
+          fill: C.accent, opacity: 0.10 }));
+        svg.appendChild(S("text", { x: 470, y: 36, "font-family": "var(--mono)",
+          "font-size": 12, fill: C.accent, "text-anchor": "middle",
+          text: "tree attention verifies every path in ONE pass" }));
+      }
+      if (step >= 3) {
+        const tp = step === 3 ? p : 1;
+        svg.appendChild(S("text", { x: lvlX[2] + 60, y: 55, "font-family": "var(--mono)",
+          "font-size": 13, fill: C.good, opacity: tp,
+          text: "kept: sat → on → the" }));
+        svg.appendChild(S("text", { x: lvlX[2] + 60, y: 74, "font-family": "var(--mono)",
+          "font-size": 11, fill: C.muted, opacity: tp,
+          text: "(longest validated path)" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl3"),
+      caption:  document.getElementById("cap3"),
+      captions: [
+        "<b>Linear draft, single point of failure.</b> A plain draft is one chain. Because Medusa's heads are <span class='k'>independent</span> — each guesses its slot without seeing earlier ones — an early wrong token invalidates everything after it.",
+        "<b>Heads fan out into a tree.</b> Medusa freezes the target and adds k <span class='k'>decoding heads</span>; taking each head's top predictions and combining them yields a <span class='k'>tree of candidate continuations</span> (the pruned Medusa tree).",
+        "<b>Tree attention, one pass.</b> A custom attention mask lets the target verify <span class='k'>every candidate path in a single forward pass</span>, scoring all branches together for the cost of one weight sweep.",
+        "<b>Keep the best path.</b> Prune the rejected branches and commit the <span class='k'>candidate with the most validated tokens</span> — here \"sat → on → the\". Then repeat from the new tip.",
+      ],
+      render,
+      dwell: 2200,
+      autoplay: false,
+    });
+  })();
+
+  /* ===================================================================
+     FIGURE 4 — Better/cheaper drafters: EAGLE & MTP (Stepper)
+     =================================================================== */
+  (function () {
+    const svg = document.getElementById("svg4");
+
+    // Layered trunk drawing (the target's transformer stack)
+    function trunk(x, y, w, label, p, highlightFeat) {
+      const g = S("g", { opacity: p });
+      const layers = 4, lh = 22, gap = 6;
+      for (let i = 0; i < layers; i++) {
+        const ly = y + i * (lh + gap);
+        const isTop = i === 0;
+        g.appendChild(S("path", { d: IOP.rr(x, ly, w, lh, 6),
+          fill: (highlightFeat && i <= 1) ? "rgba(56,189,248,.18)" : "rgba(56,189,248,.07)",
+          stroke: C.accent, "stroke-width": 1.3, opacity: isTop ? 1 : 0.8 }));
+      }
+      g.appendChild(S("text", { x: x + w / 2, y: y - 10, "text-anchor": "middle",
+        "font-family": "var(--mono)", "font-size": 11, fill: C.accent, "font-weight": 600, text: label }));
+      return g;
+    }
+
+    function tokenOut(x, y, lab, p, fill) {
+      return chip(x, y, 52, 26, fill || C.token, lab, { solid: true, fs: 11, opacity: p });
+    }
+
+    function render(step, p) {
+      clear(svg);
+      const top = 70, tw = 120;
+
+      // Three panels side by side; reveal one per step then compare.
+      // panel anchors
+      const PA = 60, PB = 360, PC = 660;
+
+      svg.appendChild(boxLabel(28, 34, "DRAFTERS  ·  same game (verify in one target pass), different proposers", C.muted, 13));
+
+      // ---- Panel A: Draft–Target (separate small model) ----
+      const showA = step >= 0 ? (step === 0 ? p : 1) : 0;
+      if (showA > 0) {
+        svg.appendChild(boxLabel(PA, 56, "Draft–Target", C.text, 13));
+        // small separate draft model
+        svg.appendChild(S("path", { d: IOP.rr(PA, top + 6, 90, 64, 9),
+          fill: "rgba(167,139,250,.12)", stroke: C.weight, "stroke-width": 1.8, opacity: showA }));
+        svg.appendChild(S("text", { x: PA + 45, y: top + 30, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 11, fill: C.weight, "font-weight": 600, text: "small", opacity: showA }));
+        svg.appendChild(S("text", { x: PA + 45, y: top + 46, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 11, fill: C.weight, text: "model", opacity: showA }));
+        // draft tokens out
+        for (let i = 0; i < 3; i++) {
+          const tp = step === 0 ? IOP.clamp((p - 0.4 - i * 0.1) / 0.4, 0, 1) : 1;
+          svg.appendChild(tokenOut(PA + 6 + i * 28, top + 92, "", tp, C.token));
+        }
+        svg.appendChild(boxLabel(PA, top + 138, "separate weights;", C.muted, 11));
+        svg.appendChild(boxLabel(PA, top + 154, "drafts from output", C.muted, 11));
+        svg.appendChild(boxLabel(PA, top + 170, "tokens only", C.muted, 11));
+        svg.appendChild(S("text", { x: PA, y: top + 196, "font-family": "var(--mono)",
+          "font-size": 11, fill: C.faint, text: "+memory: another model", opacity: showA }));
+      }
+
+      // ---- Panel B: EAGLE (feature-level decoder) ----
+      const showB = step >= 1 ? (step === 1 ? p : 1) : 0;
+      if (showB > 0) {
+        svg.appendChild(boxLabel(PB, 56, "EAGLE", C.text, 13));
+        svg.appendChild(trunk(PB, top + 8, 92, "target", showB, true));
+        // feature tap arrow from inside trunk -> lightweight decoder
+        const featY = top + 8 + 22; // near top features
+        svg.appendChild(S("line", { x1: PB + 92, y1: featY, x2: PB + 132, y2: featY,
+          stroke: C.accent, "stroke-width": 1.6, opacity: showB,
+          "marker-end": "url(#arrB)" }));
+        // arrow marker
+        svg.appendChild(S("defs", null, S("marker", { id: "arrB", markerWidth: 8, markerHeight: 8,
+          refX: 6, refY: 3, orient: "auto" }, S("path", { d: "M0,0 L6,3 L0,6 z", fill: C.accent }))));
+        svg.appendChild(S("text", { x: PB + 98, y: featY - 6, "font-family": "var(--mono)",
+          "font-size": 9.5, fill: C.accent, text: "features", opacity: showB }));
+        // lightweight decoder
+        svg.appendChild(S("path", { d: IOP.rr(PB + 134, top + 18, 70, 44, 8),
+          fill: "rgba(167,139,250,.12)", stroke: C.weight, "stroke-width": 1.8, opacity: showB }));
+        svg.appendChild(S("text", { x: PB + 169, y: top + 36, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 10, fill: C.weight, "font-weight": 600, text: "light", opacity: showB }));
+        svg.appendChild(S("text", { x: PB + 169, y: top + 50, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 10, fill: C.weight, text: "decoder", opacity: showB }));
+        for (let i = 0; i < 3; i++) {
+          const tp = step === 1 ? IOP.clamp((p - 0.5 - i * 0.1) / 0.4, 0, 1) : 1;
+          svg.appendChild(tokenOut(PB + 140 + i * 22, top + 78, "", tp, C.token));
+        }
+        svg.appendChild(boxLabel(PB, top + 138, "drafts from the target's", C.muted, 11));
+        svg.appendChild(boxLabel(PB, top + 154, "hidden features, not just", C.muted, 11));
+        svg.appendChild(boxLabel(PB, top + 170, "its emitted tokens", C.muted, 11));
+        svg.appendChild(S("text", { x: PB, y: top + 196, "font-family": "var(--mono)",
+          "font-size": 11, fill: C.good, text: "↑ acceptance rate", opacity: showB }));
+      }
+
+      // ---- Panel C: MTP (n heads on shared trunk, trained in) ----
+      const showC = step >= 2 ? (step === 2 ? p : 1) : 0;
+      if (showC > 0) {
+        svg.appendChild(boxLabel(PC, 56, "Multi-Token Prediction", C.text, 12));
+        svg.appendChild(trunk(PC, top + 8, 92, "shared trunk", showC, false));
+        // n shallow heads stacked to the right
+        const headLabels = ["t+1", "t+2", "t+3"];
+        for (let i = 0; i < 3; i++) {
+          const hy = top + 8 + i * 30;
+          const hp = step === 2 ? IOP.clamp((p - i * 0.12) / 0.5, 0, 1) : 1;
+          svg.appendChild(S("line", { x1: PC + 92, y1: top + 30, x2: PC + 126, y2: hy + 11,
+            stroke: C.weight, "stroke-width": 1.3, opacity: hp * 0.8 }));
+          svg.appendChild(S("path", { d: IOP.rr(PC + 128, hy, 58, 22, 6),
+            fill: "rgba(167,139,250,.12)", stroke: C.weight, "stroke-width": 1.5, opacity: hp }));
+          svg.appendChild(S("text", { x: PC + 157, y: hy + 15, "text-anchor": "middle",
+            "font-family": "var(--mono)", "font-size": 10, fill: C.weight, text: "head " + (i + 1), opacity: hp }));
+          // token out per head
+          svg.appendChild(tokenOut(PC + 192, hy - 2, headLabels[i], hp, C.token));
+        }
+        svg.appendChild(boxLabel(PC, top + 138, "the model itself trained", C.muted, 11));
+        svg.appendChild(boxLabel(PC, top + 154, "to predict the next n tokens", C.muted, 11));
+        svg.appendChild(boxLabel(PC, top + 170, "— free drafts at inference", C.muted, 11));
+        svg.appendChild(S("text", { x: PC, y: top + 196, "font-family": "var(--mono)",
+          "font-size": 11, fill: C.faint, text: "must be trained in (not bolt-on)", opacity: showC }));
+      }
+
+      // ---- step 3: unifying line ----
+      if (step >= 3) {
+        const up = step === 3 ? p : 1;
+        svg.appendChild(S("line", { x1: 28, y1: 300, x2: 892, y2: 300,
+          stroke: C.borderSoft, "stroke-width": 1, opacity: up }));
+        svg.appendChild(S("text", { x: 460, y: 326, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 13, fill: C.text, opacity: up,
+          text: "All four feed the SAME verify-in-one-pass loop — just better/cheaper drafters" }));
+        svg.appendChild(S("text", { x: 460, y: 350, "text-anchor": "middle",
+          "font-family": "var(--mono)", "font-size": 11, fill: C.muted, opacity: up,
+          text: "more accurate draft  →  more tokens accepted per target pass  →  more speedup" }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl4"),
+      caption:  document.getElementById("cap4"),
+      captions: [
+        "<b>Draft–Target baseline.</b> The classic drafter is a <span class='k'>separate small model</span> (e.g. Llama-8B drafting for Llama-70B). It predicts from <span class='k'>output tokens</span> only — simple, but it needs its own weights in HBM.",
+        "<b>EAGLE — draft on features.</b> A lightweight decoder reads the target's own <span class='k'>internal hidden states</span> instead of just its tokens. Less uncertainty per guess means a <span class='k'>higher acceptance rate</span> from a tiny drafter.",
+        "<b>MTP — drafting baked into training.</b> Multi-Token Prediction trains the model to predict the next <span class='k'>n tokens</span> with shallow heads on a shared trunk. Such a model can spec-decode <span class='k'>for free</span> — but it can't be bolted on after the fact.",
+        "<b>Same loop, better proposers.</b> Draft–Target, EAGLE, Medusa, and MTP all feed the <span class='k'>identical verify-in-one-pass</span> mechanism. The whole game is making the drafter cheaper and more accurate, so <span class='k'>more tokens are accepted per target pass</span>.",
+      ],
+      render,
+      dwell: 2200,
+      autoplay: false,
+    });
+  })();
+  </script>
+</body>
+</html>

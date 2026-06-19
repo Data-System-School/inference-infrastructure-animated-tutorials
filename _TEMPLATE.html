@@ -1,0 +1,131 @@
+<!doctype html>
+<!-- =====================================================================
+     MODULE PAGE TEMPLATE  — copy this structure exactly.
+     Replace: page <title>, data-mod number, hero text, figures, pager.
+     Keep the <head> links to shared.css / shared.js unchanged.
+     Two animation patterns are demonstrated below:
+       FIGURE A = IOP.Stepper  (discrete step-through, for mechanisms)
+       FIGURE B = IOP.Loop     (continuous auto-play, for illustrations)
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MODULE TITLE — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav: keep identical across pages; update prev/next hrefs ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;0 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/SLUG/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 0 · Topic group</div>
+      <h1>Module title</h1>
+      <p class="lead">One or two sentence framing of what the learner will see animated on this page.</p>
+    </header>
+
+    <!-- ================= FIGURE A — Stepper example ================= -->
+    <section class="figure">
+      <header>
+        <h3>A descriptive figure title</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">One line on what this specific animation shows.</p>
+
+      <div class="stage">
+        <svg id="svgA" viewBox="0 0 920 360" role="img" aria-label="describe the figure"></svg>
+      </div>
+
+      <div id="ctrlA"></div>                 <!-- control bar mounts here -->
+      <div id="capA" class="caption"></div>  <!-- step narration mounts here -->
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> token</span>
+        <span class="item"><span class="sw" style="background:var(--weight)"></span> weights</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV cache</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Optional short prose between figures to connect ideas. Keep it tight; the
+      animation does the teaching. Use <code>inline code</code> for symbols.</p>
+    </div>
+
+    <!-- ================= FIGURE B — Loop example ================= -->
+    <section class="figure">
+      <header>
+        <h3>A continuously-animated illustration</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">One line on what loops here.</p>
+      <div class="stage">
+        <svg id="svgB" viewBox="0 0 920 320" role="img" aria-label="describe"></svg>
+      </div>
+      <div id="ctrlB"></div>
+    </section>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="PREV.html"><span class="dir">← Previous</span><span class="ttl">Prev module title</span></a>
+      <a class="next" href="NEXT.html"><span class="dir">Next →</span><span class="ttl">Next module title</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  // ===================== FIGURE A — Stepper wiring =====================
+  (function () {
+    const svg = document.getElementById("svgA");
+    const { S, C, clear, lerp, ease } = IOP;
+
+    // Build any persistent scaffold once here (axes, frames) ...
+    // Then draw per-step in render(step, p). p = 0..1 entrance progress.
+    function render(step, p) {
+      clear(svg);
+      // EXAMPLE placeholder content — replace with real teaching visual:
+      svg.appendChild(S("rect",{x:20,y:20,width:300*p+10,height:60,rx:10,
+        fill:C.token,opacity:.85}));
+      svg.appendChild(S("text",{x:30,y:120,class:"svg-title",text:"step "+(step+1)}));
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrlA"),
+      caption:  document.getElementById("capA"),
+      captions: [
+        "<b>Step 1.</b> Narrate what is happening, highlight <span class='k'>key terms</span>.",
+        "<b>Step 2.</b> Next idea.",
+        "<b>Step 3.</b> Conclusion.",
+      ],
+      render,
+      dwell: 1700,
+      autoplay: false,
+    });
+  })();
+
+  // ===================== FIGURE B — Loop wiring =====================
+  (function () {
+    const svg = document.getElementById("svgB");
+    const { S, C, clear } = IOP;
+    function render(t) {
+      clear(svg);
+      const x = 60 + (Math.sin(t) * 0.5 + 0.5) * 700;
+      svg.appendChild(S("circle",{cx:x,cy:160,r:26,fill:C.accent}));
+    }
+    IOP.Loop({ controls: document.getElementById("ctrlB"), render, autoplay: true, speed: 1 });
+  })();
+  </script>
+</body>
+</html>

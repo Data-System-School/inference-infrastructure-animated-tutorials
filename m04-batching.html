@@ -1,0 +1,800 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Batching, Scheduling, and Paging — IOP Inference</title>
+  <link rel="stylesheet" href="shared.css">
+</head>
+<body>
+
+  <!-- ----- top nav ----- -->
+  <nav class="topnav">
+    <a class="brand" href="index.html"><span class="logo">i2</span> Inference Infrastructure</a>
+    <span class="chip">Module&nbsp;4 / 11</span>
+    <span class="spacer"></span>
+    <a class="navlink" href="index.html">All modules</a>
+    <a class="navlink" href="https://iop.systems/blog/llm-inference/batching/" target="_blank" rel="noopener">Read the article ↗</a>
+  </nav>
+
+  <main class="wrap">
+    <header class="hero">
+      <div class="eyebrow">Module 4 · Serving the batch</div>
+      <h1>Batching, Scheduling, and Paging</h1>
+      <p class="lead">GPUs are wasted one request at a time. We walk through how
+      <b>continuous batching</b> (Orca) keeps every slot full by rescheduling each
+      iteration, and how <b>PagedAttention</b> (vLLM) ends the memory waste by treating the
+      KV cache like operating-system virtual memory.</p>
+    </header>
+
+    <!-- ================= FIGURE 1 — Static batching (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Static batching: the batch waits for its slowest member</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Requests of different lengths are launched as one fixed batch.
+      The batch can't be released until the <i>longest</i> sequence finishes, so finished
+      short requests leave their GPU slot idle — wasted.</p>
+
+      <div class="stage">
+        <svg id="svg1" viewBox="0 0 920 360" role="img" aria-label="Timeline grid of four requests in a static batch; short requests finish early and their GPU slots sit idle until the longest request completes."></svg>
+      </div>
+
+      <div id="ctrl1"></div>
+      <div id="cap1" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> request / generated token</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> GPU slot doing work</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> idle slot (wasted)</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>Two problems hide in that picture. The batch is <strong>gated by the slowest
+      request</strong>, and any request that arrives while the batch runs suffers
+      <strong>head-of-line blocking</strong> — it cannot start until the whole batch is
+      done. Orca's fix is to stop thinking in whole requests and start thinking in single
+      iterations.</p>
+    </div>
+
+    <!-- ================= FIGURE 2 — Continuous batching (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Continuous batching: reschedule every iteration</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Orca runs the model's kernels for just <i>one</i> token across the
+      whole batch, then evicts finished sequences and admits waiting ones into the freed
+      slots. The batch is rebuilt each iteration, so the GPU stays full.</p>
+      <div class="stage">
+        <svg id="svg2" viewBox="0 0 920 380" role="img" aria-label="Continuous batching: each iteration generates one token per slot; completed sequences are evicted and waiting requests fill the freed slots, keeping all four slots busy."></svg>
+      </div>
+      <div id="ctrl2"></div>
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> active slot (this iteration)</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> sequence / new token</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> just finished → evicted</span>
+        <span class="item"><span class="sw" style="background:var(--muted)"></span> waiting in queue</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Tradeoff</span>
+      Switching between CPU and GPU every token adds <b>scheduling overhead</b>. It used to
+      be negligible — token generation dwarfed it — but as kernels got faster, scheduling
+      can now cost <b>up to 50%</b> for small models. Continuous batching is still the
+      execution model behind every major runtime.
+    </div>
+
+    <div class="prose">
+      <p>Continuous batching creates a new problem: if requests are constantly admitted and
+      evicted, and each needs HBM for its <code>KV cache</code>, memory could be carved up so
+      that <em>no</em> request can finish — a deadlock. Orca avoids this by
+      <strong>pre-allocating the maximum response length</strong> for every admitted request.
+      Safe, but wasteful: most requests stop well short of that maximum. That waste is exactly
+      what paging attacks.</p>
+    </div>
+
+    <!-- ================= FIGURE 3 — PagedAttention (Stepper) ================= -->
+    <section class="figure">
+      <header>
+        <h3>PagedAttention: page the KV cache like virtual memory</h3>
+        <span class="tag">step-through</span>
+      </header>
+      <p class="blurb">Reserving max-length per sequence wastes most of HBM to internal
+      fragmentation. vLLM instead splits each KV cache into fixed-size <b>blocks</b> (pages)
+      stored non-contiguously, with a per-sequence <b>block table</b> mapping logical → physical.</p>
+
+      <div class="stage">
+        <svg id="svg3" viewBox="0 0 920 420" role="img" aria-label="PagedAttention: contiguous max-length reservation leaves most slots reserved-but-unused; paging allocates fixed-size KV blocks on demand into a physical pool, with a block table mapping logical to physical addresses."></svg>
+      </div>
+
+      <div id="ctrl3"></div>
+      <div id="cap3" class="caption"></div>
+
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--token)"></span> sequence</span>
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> KV block (page)</span>
+        <span class="item"><span class="sw" style="background:var(--warn)"></span> reserved-but-unused (fragmentation)</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> block table (logical→physical)</span>
+      </div>
+    </section>
+
+    <div class="prose">
+      <p>The block table is managed on the CPU, which allocates a new block only when the
+      previous one fills and frees blocks when a request completes. Because the KV cache no
+      longer lives in contiguous memory, vLLM ships <strong>paging-aware attention
+      kernels</strong> that gather K and V through that layer of indirection. If HBM is ever
+      exhausted, vLLM <strong>evicts</strong> a request — swapping it to CPU memory or
+      discarding and recomputing it later.</p>
+    </div>
+
+    <!-- ================= FIGURE 4 — Block sharing (Loop) ================= -->
+    <section class="figure">
+      <header>
+        <h3>Block sharing: one prefix, many samples</h3>
+        <span class="tag">auto-play</span>
+      </header>
+      <p class="blurb">Decoupling logical from physical memory lets blocks be <i>shared</i>.
+      A common prompt prefix is stored once; parallel samples point at the same physical
+      blocks. On the first divergent write, vLLM does <b>copy-on-write</b> — and reference
+      counts keep a shared block alive until its last user finishes.</p>
+      <div class="stage">
+        <svg id="svg4" viewBox="0 0 920 360" role="img" aria-label="Block sharing: two samples share the same physical prefix blocks through reference counting; when one sample writes a divergent token, the block is copied on write."></svg>
+      </div>
+      <div id="ctrl4"></div>
+      <div class="legend">
+        <span class="item"><span class="sw" style="background:var(--kv)"></span> shared prefix block</span>
+        <span class="item"><span class="sw" style="background:var(--token)"></span> sample A / sample B</span>
+        <span class="item"><span class="sw" style="background:var(--compute)"></span> copy-on-write block</span>
+        <span class="item"><span class="sw" style="background:var(--mem)"></span> refcount</span>
+      </div>
+    </section>
+
+    <div class="callout">
+      <span class="lbl">Looking ahead</span>
+      Sharing identical prefixes across <i>different</i> requests is the seed of
+      <b>prefix caching</b> — the star of Module 8 (KV Cache Management and Offload).
+    </div>
+
+    <!-- ----- prev / next module ----- -->
+    <nav class="pager">
+      <a class="prev" href="m03-sharding.html"><span class="dir">← Previous</span><span class="ttl">Sharding a Model</span></a>
+      <a class="next" href="m05-flashattention.html"><span class="dir">Next →</span><span class="ttl">I/O-Aware Kernels</span></a>
+    </nav>
+
+    <footer class="foot">
+      Teaching animation for <a href="https://iop.systems/blog/llm-inference/" target="_blank" rel="noopener">IOP Systems · Inference Infrastructure</a>.
+      Built as an interactive companion. · <a href="index.html">Back to hub</a>
+    </footer>
+  </main>
+
+  <script src="shared.js"></script>
+  <script>
+  "use strict";
+
+  /* ============================================================= *
+   * FIGURE 1 — Static / request-level batching (Stepper)
+   *   A timeline grid: 4 requests of different lengths run as ONE
+   *   fixed batch. Columns = iterations. Short requests finish and
+   *   their row goes idle (red) until the longest finishes.
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg1");
+    const { S, C, clear, lerp } = IOP;
+
+    // request lengths (in iterations) — different, batch-released at max
+    const reqs = [
+      { name: "R1", len: 3 },
+      { name: "R2", len: 8 },
+      { name: "R3", len: 5 },
+      { name: "R4", len: 2 },
+    ];
+    const COLS = 8;                 // longest request = batch lifetime
+    const gx = 150, gy = 70;        // grid origin
+    const cw = 84, ch = 46, gap = 8;
+    const rowY = i => gy + i * (ch + gap);
+    const colX = j => gx + j * (cw + gap * 0.6);
+
+    // steps: reveal iterations 1..COLS, then summary
+    const TOTAL_STEPS = COLS + 1;
+
+    function render(step, p) {
+      clear(svg);
+
+      // title + axis labels
+      svg.appendChild(S("text", { x: 24, y: 34, class: "svg-title", text: "One fixed batch · 8 iterations" }));
+      svg.appendChild(S("text", { x: gx, y: 56, class: "svg-label", text: "iteration →" }));
+
+      // how many full columns are revealed (current step animates the last)
+      const fullCols = Math.min(step, COLS);
+
+      // row labels + cells
+      reqs.forEach((r, i) => {
+        svg.appendChild(S("text", { x: 24, y: rowY(i) + ch / 2 + 5, class: "svg-title", text: r.name }));
+        svg.appendChild(S("text", { x: 70, y: rowY(i) + ch / 2 + 5, class: "svg-label", text: "len " + r.len }));
+
+        for (let j = 0; j < COLS; j++) {
+          const x = colX(j), y = rowY(i);
+          // base cell
+          svg.appendChild(S("rect", {
+            x, y, width: cw, height: ch, rx: 7,
+            fill: C.panel, stroke: C.borderSoft, "stroke-width": 1,
+          }));
+
+          const revealed = j < fullCols || (j === step - 1 && step <= COLS);
+          if (!revealed) continue;
+
+          const animThis = (j === step - 1 && step <= COLS);
+          const a = animThis ? p : 1;
+
+          if (j < r.len) {
+            // active compute — generating a token
+            svg.appendChild(S("rect", {
+              x: x + 4, y: y + 4, width: (cw - 8), height: (ch - 8), rx: 5,
+              fill: C.compute, opacity: 0.16 + 0.12 * a,
+            }));
+            svg.appendChild(S("rect", {
+              x: x + 4, y: y + 4, width: (cw - 8), height: (ch - 8), rx: 5,
+              fill: "none", stroke: C.compute, "stroke-width": 1.5, opacity: a,
+            }));
+            // token chip
+            const tw = 26, th = 16;
+            svg.appendChild(S("rect", {
+              x: x + cw / 2 - tw / 2, y: y + ch / 2 - th / 2,
+              width: tw, height: th, rx: 4, fill: C.token, opacity: 0.85 * a,
+            }));
+          } else {
+            // finished short request → idle / wasted slot
+            const idleY = y + 4, idleH = ch - 8;
+            svg.appendChild(S("rect", {
+              x: x + 4, y: idleY, width: cw - 8, height: idleH, rx: 5,
+              fill: C.warn, opacity: 0.13 * a,
+            }));
+            // hatch marks
+            const stp = 9;
+            for (let hx = x + 6; hx < x + cw - 6; hx += stp) {
+              svg.appendChild(S("line", {
+                x1: hx, y1: idleY + idleH, x2: hx + idleH, y2: idleY,
+                stroke: C.warn, "stroke-width": 1, opacity: 0.4 * a,
+              }));
+            }
+          }
+        }
+
+        // "done" marker at the request's finish line
+        if (fullCols >= r.len) {
+          const fx = colX(r.len) - gap * 0.3;
+          svg.appendChild(S("line", {
+            x1: fx, y1: rowY(i) - 2, x2: fx, y2: rowY(i) + ch + 2,
+            stroke: C.token, "stroke-width": 2, "stroke-dasharray": "3 3", opacity: 0.8,
+          }));
+        }
+      });
+
+      // batch-release bracket at the end + utilization summary
+      if (step >= TOTAL_STEPS - 1) {
+        const bx = colX(COLS) + 6;
+        svg.appendChild(S("line", { x1: bx, y1: gy - 4, x2: bx, y2: rowY(reqs.length - 1) + ch + 4, stroke: C.token, "stroke-width": 2.5 }));
+        svg.appendChild(S("text", { x: bx + 8, y: gy + 36, class: "svg-title", text: "batch", fill: C.token }));
+        svg.appendChild(S("text", { x: bx + 8, y: gy + 54, class: "svg-title", text: "released", fill: C.token }));
+
+        // count wasted vs used cells
+        let used = 0, total = reqs.length * COLS;
+        reqs.forEach(r => used += Math.min(r.len, COLS));
+        const util = Math.round((used / total) * 100);
+        svg.appendChild(S("rect", { x: gx, y: rowY(reqs.length - 1) + ch + 16, width: 470, height: 30, rx: 8, fill: C.warn, opacity: 0.12 }));
+        svg.appendChild(S("text", { x: gx + 12, y: rowY(reqs.length - 1) + ch + 36, class: "svg-title",
+          text: `Slot utilization ≈ ${util}% — the red cells are paid-for, idle GPU.`, fill: C.warn }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl1"),
+      caption: document.getElementById("cap1"),
+      count: TOTAL_STEPS,
+      captions: (function () {
+        const caps = [];
+        caps.push("<b>Iteration 1.</b> Four requests launch together as <span class='k'>one fixed batch</span>. Every slot generates a token — the GPU is fully busy.");
+        caps.push("<b>Iteration 2.</b> Still full. Each request advances by exactly one token per iteration.");
+        caps.push("<b>Iteration 3.</b> <span class='k'>R4</span> (length 2) already finished last step; its slot now sits <b>idle</b> — but the batch can't be released yet.");
+        caps.push("<b>Iteration 4.</b> <span class='k'>R1</span> (length 3) finishes too. Two of four slots are now wasted, generating nothing.");
+        caps.push("<b>Iteration 5.</b> R3 nears its end. The short requests' slots stay locked, paid for but doing no work.");
+        caps.push("<b>Iteration 6.</b> Only <span class='k'>R2</span> still has real work. Three slots idle — classic <b>static-batch waste</b>.");
+        caps.push("<b>Iteration 7.</b> R2 keeps going alone; the batch is <b>gated by its slowest member</b>. New arrivals wait — <b>head-of-line blocking</b>.");
+        caps.push("<b>Iteration 8.</b> R2 finally finishes. Only now can the whole batch be <b>released</b> and slots reused.");
+        caps.push("<b>The cost.</b> A short request held a full GPU slot for the batch's whole lifetime. Continuous batching fixes this by rescheduling every single iteration →");
+        return caps;
+      })(),
+      render,
+      dwell: 1500,
+      autoplay: false,
+    });
+  })();
+
+
+  /* ============================================================= *
+   * FIGURE 2 — Continuous batching / Orca (Loop)
+   *   4 slots. Each "tick" = one decode iteration: every slot
+   *   emits a token; sequences that hit their length are EVICTED
+   *   (flash red) and the next waiting request is ADMITTED into
+   *   the freed slot. GPU stays full. A utilization bar contrasts
+   *   with Figure 1.
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg2");
+    const { S, C, clear, lerp, clamp } = IOP;
+
+    const SLOTS = 4;
+    const sx = 60, sy = 90, sw = 150, sh = 56, sgap = 22;
+    const slotY = i => sy + i * (sh + sgap);
+
+    // an endless supply of incoming requests with assorted lengths
+    const lengths = [3, 6, 2, 5, 4, 7, 3, 2, 6, 4, 5, 3, 8, 2, 4, 6];
+    let lenPtr = 0;
+    function nextLen() { const v = lengths[lenPtr % lengths.length]; lenPtr++; return v; }
+
+    // slot state: {id, len, pos}  pos = tokens generated so far
+    let nextId = 1;
+    let slots = [];
+    function newSeq() { return { id: nextId++, len: nextLen(), pos: 0 }; }
+    function initSlots() { lenPtr = 0; nextId = 1; slots = []; for (let i = 0; i < SLOTS; i++) slots.push(newSeq()); }
+    initSlots();
+
+    // queue of waiting requests (just a count + preview ids)
+    let waiting = 5;
+
+    // iteration pacing driven by Loop time
+    const TICK = 0.95;          // seconds per iteration (scaled by speed)
+    let lastTick = -1;
+    let evictFlash = {};        // slotIndex -> time-of-eviction (for red flash)
+    let totalSlotTicks = 0, busySlotTicks = 0;
+
+    function doIteration(now) {
+      // advance every slot by one token
+      const justEvicted = [];
+      for (let i = 0; i < SLOTS; i++) {
+        const s = slots[i];
+        s.pos += 1;
+        busySlotTicks += 1;        // it did real work this tick
+        totalSlotTicks += 1;
+        if (s.pos >= s.len) {
+          justEvicted.push(i);
+          evictFlash[i] = now;
+        }
+      }
+      // evict finished, admit from queue (queue never truly empties — steady stream)
+      justEvicted.forEach(i => {
+        if (waiting <= 0) waiting = 5;     // keep the demo flowing
+        waiting -= 1;
+        slots[i] = newSeq();
+      });
+    }
+
+    function render(t) {
+      clear(svg);
+
+      // header
+      svg.appendChild(S("text", { x: 24, y: 32, class: "svg-title", text: "Continuous batching — one iteration per tick, GPU always full" }));
+
+      // tick the simulation
+      const tick = Math.floor(t / TICK);
+      if (tick !== lastTick) {
+        // run iterations for any ticks we skipped (keeps fast-forward correct)
+        const steps = lastTick < 0 ? 1 : Math.min(tick - lastTick, 3);
+        for (let k = 0; k < steps; k++) doIteration(t);
+        lastTick = tick;
+      }
+      const within = (t / TICK) - Math.floor(t / TICK);  // 0..1 inside this iteration
+
+      // ---- waiting queue (left) ----
+      svg.appendChild(S("text", { x: 24, y: 70, class: "svg-label", text: "queue (FCFS, arrival order)" }));
+      const qx = 24, qy = 86;
+      for (let q = 0; q < 5; q++) {
+        const yy = qy + q * 14;
+        svg.appendChild(S("rect", { x: qx, y: yy, width: 20, height: 10, rx: 2,
+          fill: C.muted, opacity: q < waiting ? 0.5 : 0.12 }));
+      }
+
+      // ---- the 4 GPU slots ----
+      for (let i = 0; i < SLOTS; i++) {
+        const s = slots[i];
+        const y = slotY(i);
+        // slot frame
+        svg.appendChild(S("rect", { x: sx, y, width: sw, height: sh, rx: 10,
+          fill: C.panel, stroke: C.border, "stroke-width": 1.5 }));
+        svg.appendChild(S("text", { x: sx - 6, y: y + sh / 2 + 4, class: "svg-label", text: "slot " + (i + 1), "text-anchor": "end" }));
+
+        // active compute glow (always — every slot works every iteration)
+        const flash = evictFlash[i] && (t - evictFlash[i] < TICK * 0.9);
+        const baseFill = flash ? C.warn : C.compute;
+        svg.appendChild(S("rect", { x: sx + 3, y: y + 3, width: sw - 6, height: sh - 6, rx: 8,
+          fill: baseFill, opacity: flash ? 0.22 : (0.12 + 0.06 * Math.sin(within * Math.PI)) }));
+
+        // sequence id label
+        svg.appendChild(S("text", { x: sx + 12, y: y + 20, class: "svg-title",
+          text: "seq #" + s.id, fill: flash ? C.warn : C.token, "font-size": 13 }));
+
+        // token progress dots (generated so far)
+        const dotR = 4.5, dgap = 13, startX = sx + 14, dy = y + 40;
+        const shown = Math.min(s.pos, s.len);
+        for (let k = 0; k < s.len; k++) {
+          const filled = k < shown;
+          svg.appendChild(S("circle", { cx: startX + k * dgap, cy: dy, r: dotR,
+            fill: filled ? C.token : "none",
+            stroke: filled ? "none" : C.border, "stroke-width": 1,
+            opacity: filled ? 0.9 : 1 }));
+        }
+        // the freshly-emitted token "pops" during the tick
+        if (shown > 0 && within < 0.5) {
+          const k = shown - 1;
+          svg.appendChild(S("circle", { cx: startX + k * dgap, cy: dy, r: dotR + 4 * (1 - within * 2),
+            fill: "none", stroke: C.token, "stroke-width": 1.5, opacity: (1 - within * 2) }));
+        }
+
+        // status tag
+        if (flash) {
+          svg.appendChild(S("text", { x: sx + sw - 12, y: y + 20, class: "svg-label",
+            text: "✓ evicted", fill: C.warn, "text-anchor": "end" }));
+          svg.appendChild(S("text", { x: sx + sw - 12, y: y + 36, class: "svg-label",
+            text: "→ admit next", fill: C.compute, "text-anchor": "end", "font-size": 10 }));
+        } else {
+          svg.appendChild(S("text", { x: sx + sw - 12, y: y + 20, class: "svg-label",
+            text: s.pos + "/" + s.len, fill: C.muted, "text-anchor": "end" }));
+        }
+      }
+
+      // ---- scheduler arrow CPU<->GPU ----
+      const arX = sx + sw + 34;
+      svg.appendChild(S("text", { x: arX, y: sy - 18, class: "svg-label", text: "scheduler (CPU)" }));
+      svg.appendChild(S("path", { d: `M${arX},${sy} C ${arX + 40},${sy + 40} ${arX + 40},${slotY(3) - 20} ${arX},${slotY(3) + sh}`,
+        fill: "none", stroke: C.weight, "stroke-width": 1.5, opacity: 0.5, "stroke-dasharray": "4 4" }));
+      svg.appendChild(S("text", { x: arX + 8, y: (sy + slotY(3) + sh) / 2, class: "svg-label",
+        text: "rebuild batch", fill: C.weight }));
+
+      // ---- utilization meter (contrast with Fig 1) ----
+      const mx = arX + 150, my = sy + 4, mw = 270, mh = sh * 4 + sgap * 3;
+      svg.appendChild(S("text", { x: mx, y: my - 12, class: "svg-label", text: "GPU slot utilization" }));
+      svg.appendChild(S("rect", { x: mx, y: my, width: mw, height: mh, rx: 10, fill: C.panel, stroke: C.borderSoft }));
+      // continuous batching: ~100% busy
+      const fill = mh - 12;
+      svg.appendChild(S("rect", { x: mx + 6, y: my + 6, width: mw - 12, height: fill, rx: 7, fill: C.compute, opacity: 0.22 }));
+      svg.appendChild(S("rect", { x: mx + 6, y: my + 6, width: mw - 12, height: fill, rx: 7, fill: "none", stroke: C.compute, "stroke-width": 1.5 }));
+      svg.appendChild(S("text", { x: mx + mw / 2, y: my + mh / 2 - 8, class: "svg-title",
+        text: "~100%", fill: C.compute, "text-anchor": "middle", "font-size": 30 }));
+      svg.appendChild(S("text", { x: mx + mw / 2, y: my + mh / 2 + 16, class: "svg-label",
+        text: "no idle slots", fill: C.compute, "text-anchor": "middle" }));
+      svg.appendChild(S("text", { x: mx + mw / 2, y: my + mh - 12, class: "svg-label",
+        text: "vs. ~62% under static batching", fill: C.warn, "text-anchor": "middle", "font-size": 11 }));
+    }
+
+    IOP.Loop({
+      controls: document.getElementById("ctrl2"),
+      render,
+      autoplay: true,
+      speed: 1,
+    });
+  })();
+
+
+  /* ============================================================= *
+   * FIGURE 3 — PagedAttention (Stepper)
+   *   LEFT: naive contiguous reservation = max-length per seq;
+   *         huge red "reserved-but-unused" tail (internal frag),
+   *         plus an external-frag gap.
+   *   RIGHT: physical block pool + per-sequence block table;
+   *         blocks allocated on demand, non-contiguous, no waste.
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg3");
+    const { S, C, clear, lerp } = IOP;
+
+    const STEPS = 6;
+
+    // --- naive side geometry (left) ---
+    const Lx = 30, Ly = 80, Lw = 250, slotH = 26, slotGap = 10;
+    // three sequences, reserve MAX=6 each, actually use {2,4,3}
+    const MAXLEN = 6;
+    const naive = [
+      { name: "S1", used: 2 },
+      { name: "S2", used: 4 },
+      { name: "S3", used: 3 },
+    ];
+    const cellW = (Lw - 20) / MAXLEN;
+
+    // --- paged side geometry (right) ---
+    const poolX = 600, poolY = 70, blkW = 46, blkH = 30, blkGapX = 8, blkGapY = 10, perRow = 6;
+    // physical pool of 18 blocks; we fill them out of order to show non-contiguity
+    const POOL = 18;
+    // logical->physical assignment per sequence, revealed progressively
+    // (chosen non-contiguous on purpose)
+    const phys = {
+      S1: [0, 7],            // 2 blocks
+      S2: [1, 4, 9, 12],     // 4 blocks
+      S3: [3, 8, 14],        // 3 blocks
+    };
+    const seqColorIdx = { S1: 0, S2: 1, S3: 2 };
+    const seqTints = [C.token, C.kv, C.compute];   // distinct hues per seq for the table side
+
+    function poolPos(idx) {
+      const r = Math.floor(idx / perRow), c = idx % perRow;
+      return { x: poolX + c * (blkW + blkGapX), y: poolY + r * (blkH + blkGapY) };
+    }
+
+    // how many sequences are "paged in" by a given step
+    // step0: naive intro, step1: internal frag, step2: external frag,
+    // step3: paging S1, step4: paging S2, step5: paging S3 + table + done
+    function pagedCount(step) {
+      if (step <= 2) return 0;
+      return step - 2;            // 1,2,3
+    }
+
+    function render(step, p) {
+      clear(svg);
+
+      // ---------------- LEFT: naive contiguous reservation ----------------
+      svg.appendChild(S("text", { x: Lx, y: 36, class: "svg-title", text: "Naive: reserve max-length, contiguous" }));
+      svg.appendChild(S("text", { x: Lx, y: 56, class: "svg-label", text: "every request pre-allocates the maximum response" }));
+
+      naive.forEach((s, i) => {
+        const y = Ly + i * (slotH + slotGap);
+        svg.appendChild(S("text", { x: Lx - 6, y: y + slotH / 2 + 4, class: "svg-label", text: s.name, "text-anchor": "end" }));
+        for (let k = 0; k < MAXLEN; k++) {
+          const x = Lx + k * cellW;
+          const inUse = k < s.used;
+          svg.appendChild(S("rect", { x, y, width: cellW - 3, height: slotH, rx: 4,
+            fill: inUse ? C.kv : C.warn,
+            opacity: inUse ? 0.85 : (step >= 1 ? 0.22 : 0.08),
+            stroke: inUse ? "none" : C.warn, "stroke-width": inUse ? 0 : 1,
+            "stroke-dasharray": inUse ? null : "3 2" }));
+        }
+        // bracket the wasted tail once step>=1
+        if (step >= 1) {
+          const bx = Lx + s.used * cellW;
+          const bw = (MAXLEN - s.used) * cellW - 3;
+          svg.appendChild(S("rect", { x: bx, y: y - 2, width: bw, height: slotH + 4, rx: 4,
+            fill: "none", stroke: C.warn, "stroke-width": 1.2, opacity: 0.55 }));
+        }
+      });
+
+      if (step >= 1) {
+        svg.appendChild(S("text", { x: Lx, y: Ly + 3 * (slotH + slotGap) + 14, class: "svg-title",
+          text: "internal fragmentation", fill: C.warn, "font-size": 13 }));
+        svg.appendChild(S("text", { x: Lx, y: Ly + 3 * (slotH + slotGap) + 32, class: "svg-label",
+          text: "reserved-but-unused — most requests stop early" }));
+      }
+
+      // external fragmentation: a freed S? leaves a hole too small for a new max-len request
+      if (step >= 2) {
+        const fy = Ly + 3 * (slotH + slotGap) + 50;
+        svg.appendChild(S("text", { x: Lx, y: fy, class: "svg-label", text: "...and freed slots leave holes:" }));
+        const holes = [
+          { w: 1.5, free: false }, { w: 1, free: true }, { w: 2, free: false },
+          { w: 0.8, free: true }, { w: 1.7, free: false },
+        ];
+        let hx = Lx;
+        holes.forEach(h => {
+          const w = h.w * cellW;
+          svg.appendChild(S("rect", { x: hx, y: fy + 8, width: w - 3, height: slotH, rx: 4,
+            fill: h.free ? C.warn : C.kv, opacity: h.free ? 0.18 : 0.7,
+            stroke: h.free ? C.warn : "none", "stroke-dasharray": h.free ? "3 2" : null, "stroke-width": h.free ? 1 : 0 }));
+          hx += w;
+        });
+        svg.appendChild(S("text", { x: Lx, y: fy + 8 + slotH + 16, class: "svg-title",
+          text: "external fragmentation", fill: C.warn, "font-size": 13 }));
+      }
+
+      // divider arrow
+      if (step >= 3) {
+        svg.appendChild(S("path", { d: "M300,210 h40 m0,0 l-8,-6 m8,6 l-8,6",
+          stroke: C.muted, "stroke-width": 1.5, fill: "none", opacity: 0.6 }));
+        svg.appendChild(S("text", { x: 320, y: 198, class: "svg-label", text: "page it", "text-anchor": "middle" }));
+      }
+
+      // ---------------- RIGHT: paged physical pool ----------------
+      svg.appendChild(S("text", { x: poolX, y: 36, class: "svg-title", text: "PagedAttention: fixed-size blocks, on demand" }));
+      svg.appendChild(S("text", { x: poolX, y: 56, class: "svg-label", text: "physical HBM pool — blocks need not be contiguous" }));
+
+      const nPaged = pagedCount(step);
+      const activeSeqs = ["S1", "S2", "S3"].slice(0, nPaged);
+      // map physical idx -> {seq, logical}
+      const occupied = {};
+      activeSeqs.forEach(name => {
+        phys[name].forEach((pIdx, logical) => { occupied[pIdx] = { seq: name, logical }; });
+      });
+
+      // draw the whole pool
+      for (let idx = 0; idx < POOL; idx++) {
+        const { x, y } = poolPos(idx);
+        const occ = occupied[idx];
+        if (occ) {
+          // is this the block being animated in (last seq, last block)?
+          const isNewSeq = (occ.seq === activeSeqs[activeSeqs.length - 1]);
+          const a = isNewSeq ? p : 1;
+          const tint = seqTints[seqColorIdx[occ.seq]];
+          svg.appendChild(S("rect", { x, y, width: blkW, height: blkH, rx: 5,
+            fill: tint, opacity: 0.85 * a, stroke: tint, "stroke-width": 1 }));
+          svg.appendChild(S("text", { x: x + blkW / 2, y: y + blkH / 2 + 4, "text-anchor": "middle",
+            class: "svg-label", text: occ.seq + "·" + occ.logical, fill: "#06121f", opacity: a, "font-size": 10.5 }));
+        } else {
+          svg.appendChild(S("rect", { x, y, width: blkW, height: blkH, rx: 5,
+            fill: C.panel, stroke: C.borderSoft, "stroke-width": 1 }));
+        }
+      }
+      svg.appendChild(S("text", { x: poolX, y: poolY + 3 * (blkH + blkGapY) + 6, class: "svg-label",
+        text: "free blocks reusable by ANY sequence — no per-seq reservation" }));
+
+      // ---------------- block table (mem-blue) appears with last step ----------------
+      if (step >= STEPS - 1) {
+        const tx = poolX, ty = poolY + 3 * (blkH + blkGapY) + 28, tw = 312;
+        svg.appendChild(S("rect", { x: tx, y: ty, width: tw, height: 96, rx: 8,
+          fill: C.mem, opacity: 0.10, stroke: C.mem, "stroke-width": 1.2 }));
+        svg.appendChild(S("text", { x: tx + 10, y: ty + 20, class: "svg-title", text: "block table  (logical → physical)", fill: C.mem, "font-size": 13 }));
+        const rows = [
+          { s: "S1", map: phys.S1 },
+          { s: "S2", map: phys.S2 },
+          { s: "S3", map: phys.S3 },
+        ];
+        rows.forEach((r, ri) => {
+          const ry = ty + 38 + ri * 18;
+          const tint = seqTints[seqColorIdx[r.s]];
+          svg.appendChild(S("text", { x: tx + 12, y: ry, class: "svg-label", text: r.s + ":", fill: tint }));
+          svg.appendChild(S("text", { x: tx + 44, y: ry, class: "svg-label",
+            text: r.map.map((pp, li) => `[${li}]→#${pp}`).join("  "), fill: C.muted, "font-size": 11 }));
+        });
+      }
+
+      // footer takeaway
+      if (step >= STEPS - 1) {
+        svg.appendChild(S("rect", { x: 30, y: 384, width: 540, height: 28, rx: 8, fill: C.compute, opacity: 0.12 }));
+        svg.appendChild(S("text", { x: 42, y: 403, class: "svg-title",
+          text: "Internal + external fragmentation eliminated — HBM packs tightly.", fill: C.compute, "font-size": 13 }));
+      }
+    }
+
+    IOP.Stepper({
+      controls: document.getElementById("ctrl3"),
+      caption: document.getElementById("cap3"),
+      count: STEPS,
+      captions: [
+        "<b>Naive allocation.</b> To stay deadlock-safe, Orca pre-allocates each request's KV cache for the <span class='k'>maximum</span> response length, laid out contiguously.",
+        "<b>Internal fragmentation.</b> Most requests stop early, so the reserved tail (red) is <b>paid-for but never used</b> — often the majority of memory.",
+        "<b>External fragmentation.</b> When requests finish, they leave <span class='k'>holes</span> that are too small or too scattered to fit a new max-length request.",
+        "<b>Split into blocks.</b> vLLM divides each KV cache into fixed-size <span class='k'>blocks</span> (pages). S1 gets its first blocks placed wherever HBM is free — <b>non-contiguous</b>.",
+        "<b>Allocate on demand.</b> A new block is taken only when the previous one fills. S2's blocks scatter across the pool; free blocks are reusable by <b>any</b> sequence.",
+        "<b>Block table.</b> A per-sequence <span class='k'>block table</span> maps logical → physical blocks — exactly like OS <b>virtual memory</b>. Fragmentation is gone.",
+      ],
+      render,
+      dwell: 2100,
+      autoplay: false,
+    });
+  })();
+
+
+  /* ============================================================= *
+   * FIGURE 4 — Block sharing / copy-on-write (Loop)
+   *   A shared prompt prefix lives once in physical memory; two
+   *   samples (A, B) point at the same blocks (refcount=2). Each
+   *   generates its own continuation; when a sample writes a
+   *   divergent token into a shared block, it triggers
+   *   copy-on-write (a fresh green block), and the refcount drops.
+   * ============================================================= */
+  (function () {
+    const svg = document.getElementById("svg4");
+    const { S, C, clear, lerp, clamp } = IOP;
+
+    // shared prefix blocks (amber), laid out top-center
+    const PREFIX = 3;
+    const bw = 56, bh = 34, bgap = 12;
+    const prefX = 360, prefY = 40;
+    const prefPos = k => ({ x: prefX + k * (bw + bgap), y: prefY });
+
+    // sample rows
+    const aY = 150, bY = 250;
+    const sampX = 360;
+
+    // cycle ~ 9s: 0-2 share, 2-4 both extend (still shared prefix),
+    // 4-6 sample A writes divergent token into a shared block -> COW,
+    // 6-9 both keep diverging; refcount of original shows 1.
+    const CYCLE = 9;
+
+    function render(t) {
+      clear(svg);
+      const tt = t % CYCLE;
+
+      svg.appendChild(S("text", { x: 24, y: 30, class: "svg-title", text: "Block sharing — one prompt, two samples, copy-on-write" }));
+
+      // ---- shared prefix blocks ----
+      svg.appendChild(S("text", { x: prefX, y: prefY - 10, class: "svg-label", text: "shared prompt prefix (stored once)" }));
+      // after COW (t>4.5) the LAST prefix block is no longer shared by A
+      const cowTrig = tt > 4.5;
+      const cowAnim = clamp((tt - 4.5) / 1.0, 0, 1);
+      for (let k = 0; k < PREFIX; k++) {
+        const { x, y } = prefPos(k);
+        svg.appendChild(S("rect", { x, y, width: bw, height: bh, rx: 6, fill: C.kv, opacity: 0.85 }));
+        svg.appendChild(S("text", { x: x + bw / 2, y: y + bh / 2 + 4, "text-anchor": "middle",
+          class: "svg-label", text: "P" + k, fill: "#06121f", "font-size": 11 }));
+        // refcount badge
+        const isLast = k === PREFIX - 1;
+        const rc = (isLast && cowTrig) ? 1 : 2;
+        const badge = "ref " + rc;
+        svg.appendChild(S("rect", { x: x + bw - 14, y: y - 12, width: 30, height: 15, rx: 7,
+          fill: C.mem, opacity: 0.9 }));
+        svg.appendChild(S("text", { x: x + bw + 1, y: y - 1, "text-anchor": "middle",
+          class: "svg-label", text: rc, fill: "#06121f", "font-size": 10 }));
+      }
+
+      // helper to draw a sample row of pointer blocks
+      function drawSample(label, y, color, isA) {
+        svg.appendChild(S("text", { x: sampX - 12, y: y + bh / 2 + 4, class: "svg-title",
+          text: label, fill: color, "text-anchor": "end", "font-size": 13 }));
+
+        // pointers to shared prefix (dashed arrows up) + its own generated blocks
+        // both samples reference all 3 prefix blocks, EXCEPT after COW sample A
+        // replaces the last prefix block with its own copy.
+        for (let k = 0; k < PREFIX; k++) {
+          const pp = prefPos(k);
+          const px = pp.x + bw / 2, py = pp.y + bh;
+          const sx = sampX + k * (bw + bgap) + bw / 2, sy = y;
+          const isLast = k === PREFIX - 1;
+
+          if (isA && isLast && cowTrig) {
+            // copy-on-write block (green), drawn at sample A's own row position
+            const cx = sampX + k * (bw + bgap);
+            svg.appendChild(S("rect", { x: cx, y, width: bw, height: bh, rx: 6,
+              fill: C.compute, opacity: 0.85 * cowAnim, stroke: C.compute, "stroke-width": 1 }));
+            svg.appendChild(S("text", { x: cx + bw / 2, y: y + bh / 2 + 4, "text-anchor": "middle",
+              class: "svg-label", text: "P2′", fill: "#06121f", "font-size": 10, opacity: cowAnim }));
+            // little COW label
+            svg.appendChild(S("text", { x: cx + bw / 2, y: y + bh + 14, "text-anchor": "middle",
+              class: "svg-label", text: "copy-on-write", fill: C.compute, "font-size": 10, opacity: cowAnim }));
+          } else {
+            // dashed pointer up to the shared prefix block
+            svg.appendChild(S("line", { x1: sx, y1: sy, x2: px, y2: py + 2,
+              stroke: C.kv, "stroke-width": 1.2, "stroke-dasharray": "3 3", opacity: 0.55 }));
+            // small "ptr" marker box on the sample row
+            svg.appendChild(S("rect", { x: sampX + k * (bw + bgap), y, width: bw, height: bh, rx: 6,
+              fill: "none", stroke: C.kv, "stroke-width": 1, "stroke-dasharray": "4 3", opacity: 0.6 }));
+            svg.appendChild(S("text", { x: sampX + k * (bw + bgap) + bw / 2, y: y + bh / 2 + 4,
+              "text-anchor": "middle", class: "svg-label", text: "→P" + k, fill: C.kv, "font-size": 10, opacity: 0.8 }));
+          }
+        }
+
+        // each sample's own generated continuation blocks (token-colored), grow over time
+        const grow = clamp((tt - 1.5) / 5, 0, 1);
+        const ownBlocks = Math.round(grow * 3) + (cowTrig && isA ? 0 : 0);
+        const startK = PREFIX;
+        for (let g = 0; g < ownBlocks; g++) {
+          const cx = sampX + (startK + g) * (bw + bgap);
+          // sample B diverges differently; just tint both with token but slight opacity diff
+          svg.appendChild(S("rect", { x: cx, y, width: bw, height: bh, rx: 6,
+            fill: color, opacity: 0.8 }));
+          svg.appendChild(S("text", { x: cx + bw / 2, y: y + bh / 2 + 4, "text-anchor": "middle",
+            class: "svg-label", text: (isA ? "a" : "b") + g, fill: "#06121f", "font-size": 10 }));
+        }
+      }
+
+      drawSample("sample A", aY, C.token, true);
+      drawSample("sample B", bY, C.token, false);
+
+      // status line
+      let msg, col;
+      if (tt < 1.5) { msg = "Both samples point at the SAME physical prefix blocks — stored once, refcount = 2."; col = C.kv; }
+      else if (tt < 4.5) { msg = "Each sample generates its own tokens; the shared prefix stays read-only and shared."; col = C.token; }
+      else { msg = "Sample A writes a divergent token into a shared block → copy-on-write makes a private copy; the original's refcount drops to 1."; col = C.compute; }
+      svg.appendChild(S("rect", { x: 24, y: 320, width: 872, height: 30, rx: 8, fill: col, opacity: 0.12 }));
+      svg.appendChild(S("text", { x: 36, y: 340, class: "svg-title", text: msg, fill: col, "font-size": 12.5 }));
+    }
+
+    IOP.Loop({
+      controls: document.getElementById("ctrl4"),
+      render,
+      autoplay: true,
+      speed: 0.9,
+    });
+  })();
+  </script>
+</body>
+</html>
